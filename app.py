@@ -5,10 +5,8 @@ Architecture complète :
 - Confidentialité stricte des échanges (Matching Privé réservé aux étudiants impliqués)
 - Centre de Notifications dynamique en haut à droite + Onglet Alertes
 - Alertes Email automatiques via SMTP (smtplib + email.mime + st.secrets['smtp'])
-- Récupération de code PIN oublié par email & modification du code PIN
 - Gestion complète des offres (Modification pré-remplie + Suppression avec confirmation)
-- Accès Administrateur discret tout en bas à droite de "Gérer mon offre" (st.secrets['admin']['password'])
-- Mentions développeur (Sidebar & Footer global) : Imrane Machbaête — Version Alpha
+- Espace Administrateur (st.secrets['admin']['password'])
 
 Exécution : streamlit run app.py
 """
@@ -171,6 +169,7 @@ HOPITAL_VERS_REGION = {
     for hopital in liste_reg
 }
 
+# Colonnes exactes des 3 feuilles Google Sheets
 COLONNES_UTILISATEURS = [
     "User_ID",
     "Nom",
@@ -285,15 +284,11 @@ def save_utilisateurs(df: pd.DataFrame) -> bool:
     """Met à jour la feuille 'Utilisateurs' dans Google Sheets."""
     try:
         conn = get_connection()
-        clean_df = df.copy()
-        for col in COLONNES_UTILISATEURS:
-            if col not in clean_df.columns:
-                clean_df[col] = ""
-        clean_df["PIN"] = normalize_pin_series(clean_df["PIN"])
-        conn.update(worksheet=FEUILLE_UTILISATEURS, data=clean_df[COLONNES_UTILISATEURS])
+        conn.update(worksheet=FEUILLE_UTILISATEURS, data=df[COLONNES_UTILISATEURS])
+        st.cache_data.clear()
         return True
     except Exception as exc:
-        st.error(f"Erreur lors de l'enregistrement de l'utilisateur : {exc}")
+        st.error(f"Erreur lors de l'écriture dans la feuille '{FEUILLE_UTILISATEURS}' : {exc}")
         return False
 
 
@@ -309,7 +304,7 @@ def load_demandes() -> pd.DataFrame:
             if col not in df.columns:
                 df[col] = ""
         df["PIN"] = normalize_pin_series(df["PIN"])
-        for col in ["Nom", "Email", "Periode", "Specialite", "Hopital_Actuel", "Hopitaux_Souhaites"]:
+        for col in ["Timestamp", "Nom", "Email", "Periode", "Specialite", "Hopital_Actuel", "Hopitaux_Souhaites"]:
             df[col] = df[col].fillna("").astype(str).str.strip()
         return df[COLONNES_DEMANDES]
     except Exception as exc:
@@ -321,15 +316,11 @@ def save_demandes(df: pd.DataFrame) -> bool:
     """Met à jour la feuille 'Demandes' dans Google Sheets."""
     try:
         conn = get_connection()
-        clean_df = df.copy()
-        for col in COLONNES_DEMANDES:
-            if col not in clean_df.columns:
-                clean_df[col] = ""
-        clean_df["PIN"] = normalize_pin_series(clean_df["PIN"])
-        conn.update(worksheet=FEUILLE_DEMANDES, data=clean_df[COLONNES_DEMANDES])
+        conn.update(worksheet=FEUILLE_DEMANDES, data=df[COLONNES_DEMANDES])
+        st.cache_data.clear()
         return True
     except Exception as exc:
-        st.error(f"Erreur lors de l'enregistrement de la demande : {exc}")
+        st.error(f"Erreur lors de l'écriture dans la feuille '{FEUILLE_DEMANDES}' : {exc}")
         return False
 
 
@@ -344,7 +335,6 @@ def load_messages() -> pd.DataFrame:
         for col in COLONNES_MESSAGES:
             if col not in df.columns:
                 df[col] = ""
-        for col in COLONNES_MESSAGES:
             df[col] = df[col].fillna("").astype(str).str.strip()
         return df[COLONNES_MESSAGES]
     except Exception as exc:
@@ -352,19 +342,39 @@ def load_messages() -> pd.DataFrame:
         return pd.DataFrame(columns=COLONNES_MESSAGES)
 
 
-def save_messages(df: pd.DataFrame) -> bool:
-    """Met à jour la feuille 'Messages' dans Google Sheets."""
+def append_message(
+    df_messages: pd.DataFrame,
+    room_id: str,
+    sender_email: str,
+    sender_name: str,
+    texte: str,
+) -> bool:
+    """Ajoute un message dans la feuille 'Messages' et vide le cache."""
+    nouveau_msg = pd.DataFrame(
+        [
+            {
+                "Message_ID": f"MSG_{uuid.uuid4().hex[:10].upper()}",
+                "Room_ID": room_id,
+                "Sender_Email": sender_email.strip().lower(),
+                "Sender_Name": sender_name.strip(),
+                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "Texte": texte.strip(),
+            }
+        ]
+    )
+    df_maj = pd.concat([df_messages, nouveau_msg], ignore_index=True)
     try:
         conn = get_connection()
-        clean_df = df.copy()
-        for col in COLONNES_MESSAGES:
-            if col not in clean_df.columns:
-                clean_df[col] = ""
-        conn.update(worksheet=FEUILLE_MESSAGES, data=clean_df[COLONNES_MESSAGES])
+        conn.update(worksheet=FEUILLE_MESSAGES, data=df_maj[COLONNES_MESSAGES])
+        st.cache_data.clear()
         return True
     except Exception as exc:
-        st.error(f"Erreur lors de l'enregistrement du message : {exc}")
+        st.error(f"Erreur lors de l'envoi du message : {exc}")
         return False
+
+
+def serialize_hospitals(hospitals: list[str]) -> str:
+    return "; ".join([h.strip() for h in hospitals if h.strip()])
 
 
 def parse_hospitals(raw_str: str) -> list[str]:
@@ -373,285 +383,447 @@ def parse_hospitals(raw_str: str) -> list[str]:
     return [h.strip() for h in str(raw_str).split(";") if h.strip()]
 
 
-def serialize_hospitals(hospitals: list[str]) -> str:
-    return ";".join(dict.fromkeys(h.strip() for h in hospitals if h.strip()))
+def build_room_id(periode: str, specialite: str, emails: list[str]) -> str:
+    sorted_emails = sorted([e.strip().lower() for e in emails])
+    return f"ROOM_{periode}_{specialite}_{'_'.join(sorted_emails)}"
+
+
+# Initialisation du registre anti-doublon d'envoi d'emails en session
+if "notified_match_rooms" not in st.session_state:
+    st.session_state["notified_match_rooms"] = set()
 
 
 # ---------------------------------------------------------------------------
-# 4. ENVOI D'ALERTES EMAIL AUTOMATIQUES VIA SMTP (smtplib + email.mime)
+# 4. SYSTÈME D'ALERTES PAR EMAIL (OPTION A : UNIQUEMENT EN CAS DE MATCH DIRECT)
 # ---------------------------------------------------------------------------
-def send_smtp_match_notification(destinataires_emails: list[str], subject: str, body: str) -> bool:
-    """Envoie un email via SMTP avec smtplib et email.mime.text.MIMEText."""
+def resolve_student_prenom(
+    email: str, fallback_nom: str, df_utilisateurs: pd.DataFrame
+) -> str:
+    """Récupère le prénom de l'étudiant depuis la feuille 'Utilisateurs' ou depuis son nom complet."""
+    clean_email = (email or "").strip().lower()
+    if df_utilisateurs is not None and not df_utilisateurs.empty and clean_email:
+        rows = df_utilisateurs[
+            df_utilisateurs["Email"].astype(str).str.strip().str.lower() == clean_email
+        ]
+        if not rows.empty:
+            prenom_val = str(rows.iloc[0].get("Prenom", "")).strip()
+            if prenom_val:
+                return prenom_val
+    if fallback_nom and str(fallback_nom).strip():
+        return str(fallback_nom).strip().split()[0]
+    return "Étudiant(e)"
+
+
+def send_match_notification_emails(
+    participants: list[dict],
+    periode: str,
+    specialite: str,
+    room_id: str,
+    df_utilisateurs: pd.DataFrame,
+) -> int:
+    """
+    Option A stricte : Envoie un email individuel personnalisé uniquement aux 2 ou 3 étudiants
+    faisant partie intégrante d'un nouveau cycle complet (bilatéral ou triangulaire).
+    Anti-plantage absolu (try/except) et anti-doublon par Room_ID.
+    """
+    if room_id in st.session_state["notified_match_rooms"]:
+        return 0
+
     try:
-        smtp_conf = st.secrets["smtp"]
-        smtp_server = smtp_conf["server"]
-        smtp_port = int(smtp_conf.get("port", 587))
-        smtp_user = smtp_conf["username"]
-        smtp_pwd = smtp_conf["password"]
-
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"] = smtp_user
-        msg["To"] = ", ".join(destinataires_emails)
-
-        with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_pwd)
-            server.sendmail(smtp_user, destinataires_emails, msg.as_string())
-        return True
+        smtp_cfg = st.secrets["smtp"]
+        smtp_server = str(smtp_cfg["server"]).strip()
+        smtp_port = int(smtp_cfg["port"])
+        smtp_user = str(smtp_cfg["username"]).strip()
+        smtp_password = str(smtp_cfg["password"])
     except Exception:
-        return False
+        # Si les secrets SMTP ne sont pas configurés, l'enregistrement Google Sheets reste prioritaire
+        return 0
 
+    sujet = "[PermutStage] Un échange de stage est disponible pour vous !"
+    sent_count = 0
+    seen_dest = set()
 
-def trigger_new_match_emails(anciens_rooms: set, df_demandes_maj: pd.DataFrame, df_utilisateurs: pd.DataFrame, df_messages: pd.DataFrame):
-    """Détecte les nouveaux matchs créés et expédie une alerte email automatique."""
     try:
-        all_binomes_apres, all_tri_apres = compute_all_matches(df_demandes_maj)
-        nouveaux_binomes = [m for m in all_binomes_apres if m["room_id"] not in anciens_rooms]
-        nouveaux_tri = [t for t in all_tri_apres if t["room_id"] not in anciens_rooms]
+        with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as server:
+            server.ehlo()
+            if smtp_port in (587, 25):
+                server.starttls()
+                server.ehlo()
+            server.login(smtp_user, smtp_password)
 
-        app_url = "https://stages-medecine-ucl.streamlit.app/"
+            for participant in participants:
+                dest_email = str(participant.get("Email", "")).strip().lower()
+                if not dest_email or dest_email in seen_dest:
+                    continue
+                seen_dest.add(dest_email)
 
-        for m in nouveaux_binomes:
-            emails = [m["user1"]["Email"].strip().lower(), m["user2"]["Email"].strip().lower()]
-            p = m["periode"]
-            s = m["specialite"]
-            h1 = m["user1"]["Hopital_Actuel"]
-            h2 = m["user2"]["Hopital_Actuel"]
-
-            for dest_email, dest_name, part_name, mon_hop, son_hop in [
-                (emails[0], m["user1"]["Nom"], m["user2"]["Nom"], h1, h2),
-                (emails[1], m["user2"]["Nom"], m["user1"]["Nom"], h2, h1),
-            ]:
-                subject = f"[PermutStage] Nouveau Match détecté pour votre stage de {s} ({p})"
-                body = (
-                    f"Bonjour {dest_name},\n\n"
-                    f"Bonne nouvelle ! Une permutation directe a été trouvée pour votre stage de {s} en période {p}.\n\n"
-                    f"Détails de l'échange :\n"
-                    f"- Votre stage actuel : {mon_hop}\n"
-                    f"- Stage proposé par {part_name} : {son_hop}\n\n"
-                    f"Votre salon de discussion privé et confidentiel est désormais ouvert sur la plateforme :\n"
-                    f"{app_url}\n\n"
-                    f"Connectez-vous pour finaliser votre accord en toute discrétion.\n\n"
+                prenom = resolve_student_prenom(
+                    dest_email, participant.get("Nom", ""), df_utilisateurs
+                )
+                corps = (
+                    f"Bonjour {prenom},\n\n"
+                    f"Une opportunité d'échange direct vient de se former pour votre stage de {specialite} ({periode}) !\n\n"
+                    f"Un salon de discussion privé et sécurisé a été ouvert sur l'application. Connectez-vous dès maintenant sur PermutStage avec votre adresse étudiante et votre code PIN pour consulter les détails du match et finaliser l'échange :\n"
+                    f"https://stages-medecine-ucl.streamlit.app/\n\n"
+                    f"À très vite,\n"
                     f"L'équipe PermutStage"
                 )
-                send_smtp_match_notification([dest_email], subject, body)
+
+                try:
+                    msg = MIMEText(corps, "plain", "utf-8")
+                    msg["Subject"] = sujet
+                    msg["From"] = smtp_user
+                    msg["To"] = dest_email
+                    server.send_message(msg)
+                    sent_count += 1
+                except Exception as e:
+                    # Anti-plantage individuel si une adresse email destinataire est invalide
+                    continue
+
+        st.session_state["notified_match_rooms"].add(room_id)
+        return sent_count
+    except Exception as e:
+        # Anti-plantage absolu : aucun écran rouge si le serveur SMTP a un ralentissement
+        return sent_count
+
+
+def trigger_new_match_emails(
+    anciens_rooms: set[str],
+    df_demandes_maj: pd.DataFrame,
+    df_utilisateurs: pd.DataFrame,
+    df_messages: pd.DataFrame,
+) -> None:
+    """
+    Vérifie automatiquement après un ajout ou une modification dans 'Demandes' si un nouveau
+    cycle complet (bilatéral A<->B ou triangulaire A->B->C->A) vient de se former.
+    N'envoie jamais d'email pour une offre isolée ou un match déjà existant.
+    """
+    try:
+        rooms_deja_actifs = set(anciens_rooms) | set(
+            st.session_state.get("notified_match_rooms", set())
+        )
+        if df_messages is not None and not df_messages.empty and "Room_ID" in df_messages.columns:
+            rooms_deja_actifs |= set(
+                df_messages["Room_ID"].dropna().astype(str).str.strip().unique()
+            )
+
+        nouveaux_bi = compute_bilateral_matches(df_demandes_maj)
+        nouveaux_tri = compute_triangular_matches(df_demandes_maj)
+
+        for m in nouveaux_bi:
+            if m["room_id"] not in rooms_deja_actifs:
+                send_match_notification_emails(
+                    participants=m["participants"],
+                    periode=m["periode"],
+                    specialite=m["specialite"],
+                    room_id=m["room_id"],
+                    df_utilisateurs=df_utilisateurs,
+                )
 
         for t in nouveaux_tri:
-            u1, u2, u3 = t["user1"], t["user2"], t["user3"]
-            p = t["periode"]
-            s = t["specialite"]
-            tri_data = [
-                (u1["Email"], u1["Nom"], u2["Nom"], u1["Hopital_Actuel"], u2["Hopital_Actuel"]),
-                (u2["Email"], u2["Nom"], u3["Nom"], u2["Hopital_Actuel"], u3["Hopital_Actuel"]),
-                (u3["Email"], u3["Nom"], u1["Nom"], u3["Hopital_Actuel"], u1["Hopital_Actuel"]),
-            ]
-            for dest_email, dest_name, receveur_nom, mon_hop, cible_hop in tri_data:
-                subject = f"[PermutStage] Boucle triangulaire détectée pour votre stage de {s} ({p})"
-                body = (
-                    f"Bonjour {dest_name},\n\n"
-                    f"Une opportunité d'échange en boucle triangulaire (3 étudiants) a été identifiée pour votre stage de {s} ({p}).\n\n"
-                    f"Votre affectation actuelle : {mon_hop}\n"
-                    f"L'hôpital que vous obtiendrez : {cible_hop}\n\n"
-                    f"Rejoignez le salon de discussion tripartite confidentiel sur PermutStage :\n"
-                    f"{app_url}\n\n"
-                    f"L'équipe PermutStage"
+            if t["room_id"] not in rooms_deja_actifs:
+                send_match_notification_emails(
+                    participants=t["participants"],
+                    periode=t["periode"],
+                    specialite=t["specialite"],
+                    room_id=t["room_id"],
+                    df_utilisateurs=df_utilisateurs,
                 )
-                send_smtp_match_notification([dest_email], subject, body)
-    except Exception:
+    except Exception as e:
+        # Priorité absolue à la persistance Google Sheets
         pass
 
 
 def send_pin_recovery_email(dest_email: str, prenom: str, pin: str) -> bool:
-    """Envoie le code PIN par email via SMTP en cas d'oubli de l'étudiant."""
+    """
+    Envoie le code PIN par email via SMTP en cas d'oubli de l'étudiant.
+    Respecte l'objet et le corps de message demandés.
+    """
     try:
-        smtp_conf = st.secrets["smtp"]
-        smtp_server = smtp_conf["server"]
-        smtp_port = int(smtp_conf.get("port", 587))
-        smtp_user = smtp_conf["username"]
-        smtp_pwd = smtp_conf["password"]
+        smtp_cfg = st.secrets["smtp"]
+        smtp_server = str(smtp_cfg["server"]).strip()
+        smtp_port = int(smtp_cfg["port"])
+        smtp_user = str(smtp_cfg["username"]).strip()
+        smtp_password = str(smtp_cfg["password"])
+    except Exception:
+        raise RuntimeError("Configuration SMTP introuvable dans st.secrets['smtp'].")
 
-        subject = "[PermutStage] Récupération de votre code PIN"
-        body = (
-            f"Bonjour {prenom},\n\n"
-            f"Vous avez demandé la récupération de votre code PIN pour accéder à PermutStage.\n\n"
-            f"Votre code PIN de connexion est : {pin}\n\n"
-            f"Vous pouvez désormais vous connecter directement sur la plateforme :\n"
-            f"https://stages-medecine-ucl.streamlit.app/\n\n"
-            f"Si vous n'êtes pas à l'origine de cette demande, vous pouvez ignorer cet email ou modifier votre PIN depuis votre profil.\n\n"
-            f"L'équipe PermutStage"
-        )
+    pin_formatte = str(pin).strip().zfill(4)
+    sujet = "[PermutStage] Récupération de votre code PIN"
+    corps = (
+        f"Bonjour {prenom},\n\n"
+        f"Vous avez demandé la récupération de votre code PIN pour accéder à PermutStage.\n\n"
+        f"Votre code PIN de connexion est : {pin_formatte}\n\n"
+        f"Vous pouvez désormais vous connecter directement sur la plateforme :\n"
+        f"https://stages-medecine-ucl.streamlit.app/\n\n"
+        f"Si vous n'êtes pas à l'origine de cette demande, vous pouvez ignorer cet email ou modifier votre PIN depuis votre profil.\n\n"
+        f"L'équipe PermutStage"
+    )
 
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"] = smtp_user
-        msg["To"] = dest_email
-
-        with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as server:
+    with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as server:
+        server.ehlo()
+        if smtp_port in (587, 25):
             server.starttls()
-            server.login(smtp_user, smtp_pwd)
-            server.sendmail(smtp_user, [dest_email], msg.as_string())
-        return True
-    except Exception as exc:
-        raise exc
+            server.ehlo()
+        server.login(smtp_user, smtp_password)
+
+        msg = MIMEText(corps, "plain", "utf-8")
+        msg["Subject"] = sujet
+        msg["From"] = smtp_user
+        msg["To"] = dest_email.strip().lower()
+        server.send_message(msg)
+    return True
 
 
 # ---------------------------------------------------------------------------
 # 5. MOTEUR DE MATCHING & FILTRE DE CONFIDENTIALITÉ STRICTE
 # ---------------------------------------------------------------------------
-def compute_all_matches(df: pd.DataFrame):
-    """Calcule tous les binômes et boucles triangulaires compatibles."""
-    bilaterals = []
-    triangulars = []
-    if df.empty or len(df) < 2:
-        return bilaterals, triangulars
-
+def compute_bilateral_matches(df: pd.DataFrame) -> list[dict]:
+    """Détecte tous les échanges bilatéraux (A <-> B) pour même période et même spécialité."""
+    matches = []
     records = df.to_dict("records")
-    for r in records:
-        r["_souhaits"] = set(parse_hospitals(r.get("Hopitaux_Souhaites", "")))
-
     n = len(records)
+
     for i in range(n):
         for j in range(i + 1, n):
-            u1, u2 = records[i], records[j]
-            if u1["Email"].strip().lower() == u2["Email"].strip().lower():
+            a, b = records[i], records[j]
+            if a["Periode"] != b["Periode"] or a["Specialite"] != b["Specialite"]:
                 continue
-            if u1["Periode"] != u2["Periode"] or u1["Specialite"] != u2["Specialite"]:
+            if a["Hopital_Actuel"] == b["Hopital_Actuel"]:
                 continue
-            if u2["Hopital_Actuel"] in u1["_souhaits"] and u1["Hopital_Actuel"] in u2["_souhaits"]:
-                sorted_emails = sorted([u1["Email"].strip().lower(), u2["Email"].strip().lower()])
-                room_id = f"match_2_{u1['Periode']}_{u1['Specialite']}_{sorted_emails[0]}_{sorted_emails[1]}"
-                bilaterals.append({
-                    "user1": u1,
-                    "user2": u2,
-                    "periode": u1["Periode"],
-                    "specialite": u1["Specialite"],
-                    "room_id": room_id,
-                })
 
-    if n >= 3:
-        for i in range(n):
-            for j in range(n):
-                if i == j:
+            souhaites_a = set(parse_hospitals(a["Hopitaux_Souhaites"]))
+            souhaites_b = set(parse_hospitals(b["Hopitaux_Souhaites"]))
+
+            if (
+                a["Hopital_Actuel"] in souhaites_b
+                and b["Hopital_Actuel"] in souhaites_a
+            ):
+                room_id = build_room_id(
+                    a["Periode"], a["Specialite"], [a["Email"], b["Email"]]
+                )
+                matches.append(
+                    {
+                        "room_id": room_id,
+                        "periode": a["Periode"],
+                        "specialite": a["Specialite"],
+                        "participants": [a, b],
+                        "emails": [
+                            a["Email"].strip().lower(),
+                            b["Email"].strip().lower(),
+                        ],
+                        "a": a,
+                        "b": b,
+                    }
+                )
+    return matches
+
+
+def compute_triangular_matches(df: pd.DataFrame) -> list[dict]:
+    """Détecte tous les cycles à 3 personnes (A donne à B, B donne à C, C donne à A)."""
+    matches = []
+    seen_cycles = set()
+    records = df.to_dict("records")
+    n = len(records)
+
+    souhaites_map = {
+        idx: set(parse_hospitals(rec["Hopitaux_Souhaites"]))
+        for idx, rec in enumerate(records)
+    }
+
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            a, b = records[i], records[j]
+            if a["Periode"] != b["Periode"] or a["Specialite"] != b["Specialite"]:
+                continue
+            if a["Hopital_Actuel"] == b["Hopital_Actuel"]:
+                continue
+            if a["Hopital_Actuel"] not in souhaites_map[j]:
+                continue
+
+            for k in range(n):
+                if k in (i, j):
                     continue
-                for k in range(n):
-                    if k == i or k == j:
-                        continue
-                    u1, u2, u3 = records[i], records[j], records[k]
-                    e1 = u1["Email"].strip().lower()
-                    e2 = u2["Email"].strip().lower()
-                    e3 = u3["Email"].strip().lower()
-                    if len({e1, e2, e3}) < 3:
-                        continue
-                    if not (u1["Periode"] == u2["Periode"] == u3["Periode"]):
-                        continue
-                    if not (u1["Specialite"] == u2["Specialite"] == u3["Specialite"]):
-                        continue
-                    if (
-                        u2["Hopital_Actuel"] in u1["_souhaits"]
-                        and u3["Hopital_Actuel"] in u2["_souhaits"]
-                        and u1["Hopital_Actuel"] in u3["_souhaits"]
-                    ):
-                        sorted_tri_emails = sorted([e1, e2, e3])
-                        tri_room_id = f"match_3_{u1['Periode']}_{u1['Specialite']}_{sorted_tri_emails[0]}_{sorted_tri_emails[1]}_{sorted_tri_emails[2]}"
-                        if not any(t["room_id"] == tri_room_id for t in triangulars):
-                            triangulars.append({
-                                "user1": u1,
-                                "user2": u2,
-                                "user3": u3,
-                                "periode": u1["Periode"],
-                                "specialite": u1["Specialite"],
-                                "room_id": tri_room_id,
-                            })
+                c = records[k]
+                if c["Periode"] != a["Periode"] or c["Specialite"] != a["Specialite"]:
+                    continue
+                if (
+                    c["Hopital_Actuel"] == a["Hopital_Actuel"]
+                    or c["Hopital_Actuel"] == b["Hopital_Actuel"]
+                ):
+                    continue
 
-    return bilaterals, triangulars
+                if (
+                    b["Hopital_Actuel"] in souhaites_map[k]
+                    and c["Hopital_Actuel"] in souhaites_map[i]
+                ):
+                    id_a = f"{a['Email'].lower()}_{a['Periode']}"
+                    id_b = f"{b['Email'].lower()}_{b['Periode']}"
+                    id_c = f"{c['Email'].lower()}_{c['Periode']}"
+                    rotations = sorted(
+                        [
+                            (id_a, id_b, id_c),
+                            (id_b, id_c, id_a),
+                            (id_c, id_a, id_b),
+                        ]
+                    )
+                    canonical = rotations[0]
+                    if canonical not in seen_cycles:
+                        seen_cycles.add(canonical)
+                        room_id = build_room_id(
+                            a["Periode"],
+                            a["Specialite"],
+                            [a["Email"], b["Email"], c["Email"]],
+                        )
+                        matches.append(
+                            {
+                                "room_id": room_id,
+                                "periode": a["Periode"],
+                                "specialite": a["Specialite"],
+                                "participants": [a, b, c],
+                                "emails": [
+                                    a["Email"].strip().lower(),
+                                    b["Email"].strip().lower(),
+                                    c["Email"].strip().lower(),
+                                ],
+                                "a": a,
+                                "b": b,
+                                "c": c,
+                            }
+                        )
+    return matches
 
 
-def get_private_matches_for_user(email: str, all_binomes: list, all_triangulaires: list):
-    """Filtre strict de confidentialité."""
-    if not email:
+def filter_private_matches_for_user(
+    user_email: str | None,
+    all_bilateral: list[dict],
+    all_triangular: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """
+    RÈGLE ABSOLUE DE CONFIDENTIALITÉ :
+    Ne retourne QUE les matchs impliquant directement l'étudiant connecté.
+    Un visiteur non connecté ou un étudiant tiers ne voit aucun match.
+    """
+    if not user_email:
         return [], []
-    e = email.strip().lower()
-    mes_binomes = [
-        m for m in all_binomes
-        if m["user1"]["Email"].strip().lower() == e or m["user2"]["Email"].strip().lower() == e
-    ]
-    mes_tri = [
-        t for t in all_triangulaires
-        if t["user1"]["Email"].strip().lower() == e
-        or t["user2"]["Email"].strip().lower() == e
-        or t["user3"]["Email"].strip().lower() == e
-    ]
-    return mes_binomes, mes_tri
+    clean_email = user_email.strip().lower()
+    my_bi = [m for m in all_bilateral if clean_email in m["emails"]]
+    my_tri = [t for t in all_triangular if clean_email in t["emails"]]
+    return my_bi, my_tri
 
 
-def build_user_notifications(email: str, mes_binomes: list, mes_tri: list, df_messages: pd.DataFrame):
-    """Génère le centre de notifications."""
+def build_user_notifications(
+    user_email: str | None,
+    my_bi: list[dict],
+    my_tri: list[dict],
+    df_messages: pd.DataFrame,
+) -> list[dict]:
+    """Construit la liste des alertes (matchs actifs et messages reçus) pour l'étudiant connecté."""
+    if not user_email:
+        return []
+    clean_email = user_email.strip().lower()
     notifs = []
-    if not email:
-        return notifs
-    em_clean = email.strip().lower()
+    my_rooms = set()
 
-    for m in mes_binomes:
-        part = m["user2"] if m["user1"]["Email"].strip().lower() == em_clean else m["user1"]
-        notifs.append({
-            "titre": f"🤝 Match direct disponible ({m['periode']} · {m['specialite']})",
-            "detail": f"Échange possible avec {part['Nom']} : vous obtenez '{part['Hopital_Actuel']}'. Salon privé accessible.",
-            "room_id": m["room_id"],
-        })
+    for m in my_bi:
+        my_rooms.add(m["room_id"])
+        notifs.append(
+            {
+                "titre": f"Nouvelle proposition d'échange trouvée pour votre stage de {m['specialite']} en {m['periode']} !",
+                "detail": "Match bilatéral (binôme) disponible dans votre salon privé.",
+                "room_id": m["room_id"],
+            }
+        )
 
-    for t in mes_tri:
-        notifs.append({
-            "titre": f"🔄 Boucle triangulaire active ({t['periode']} · {t['specialite']})",
-            "detail": "Une combinaison à 3 étudiants est complète pour votre stage. Consultez le salon tripartite.",
-            "room_id": t["room_id"],
-        })
+    for t in my_tri:
+        my_rooms.add(t["room_id"])
+        notifs.append(
+            {
+                "titre": f"Nouvelle proposition d'échange trouvée pour votre stage de {t['specialite']} en {t['periode']} !",
+                "detail": "Salon d'échange triangulaire (cycle à 3 personnes) ouvert pour vous.",
+                "room_id": t["room_id"],
+            }
+        )
 
-    if not df_messages.empty and "Room_ID" in df_messages.columns:
-        mes_rooms = {m["room_id"] for m in mes_binomes} | {t["room_id"] for t in mes_tri}
-        nouveaux_msg = df_messages[
-            df_messages["Room_ID"].isin(mes_rooms)
-            & (df_messages["Sender_Email"].str.lower() != em_clean)
+    if not df_messages.empty and my_rooms:
+        msgs_for_me = df_messages[
+            (df_messages["Room_ID"].isin(my_rooms))
+            & (df_messages["Sender_Email"].str.lower() != clean_email)
         ]
-        if not nouveaux_msg.empty:
-            for room_id, g in nouveaux_msg.groupby("Room_ID"):
-                last_m = g.iloc[-1]
-                notifs.append({
-                    "titre": f"💬 Nouveau message de {last_m['Sender_Name']}",
-                    "detail": f"« {last_m['Texte'][:60]}... » (Salon privé)",
-                    "room_id": room_id,
-                })
+        for _, msg in msgs_for_me.iterrows():
+            notifs.append(
+                {
+                    "titre": f"Nouveau message de {msg['Sender_Name']} ({msg['Timestamp']})",
+                    "detail": f"« {msg['Texte']} »",
+                    "room_id": msg["Room_ID"],
+                }
+            )
+
     return notifs
 
 
 # ---------------------------------------------------------------------------
-# 6. CHARGEMENT INITIAL DES DONNÉES
+# 6. COMPOSANT DE SALON DE CHAT PRIVÉ (RÉSERVÉ AUX MEMBRES CONNECTÉS DU MATCH)
+# ---------------------------------------------------------------------------
+def render_private_chat_room(
+    room_id: str,
+    current_user: dict,
+    df_messages: pd.DataFrame,
+    label_expander: str,
+):
+    """Salon de discussion privé : l'étudiant est déjà authentifié via st.session_state['user']."""
+    messages_salon = df_messages[df_messages["Room_ID"] == room_id]
+    nb_msg = len(messages_salon)
+    user_email = current_user["Email"].strip().lower()
+    user_full_name = f"{current_user['Prenom']} {current_user['Nom']}".strip()
+
+    with st.expander(f"💬 {label_expander} ({nb_msg} message(s))", expanded=True):
+        if messages_salon.empty:
+            st.caption("Aucun message dans ce salon privé. Envoyez le premier message à vos collègues !")
+        else:
+            for _, msg in messages_salon.iterrows():
+                is_me = msg["Sender_Email"].strip().lower() == user_email
+                role = "user" if is_me else "assistant"
+                with st.chat_message(role):
+                    st.markdown(
+                        f"**{msg['Sender_Name']}** · *{msg['Timestamp']}*\n\n{msg['Texte']}"
+                    )
+
+        nouveau_texte = st.chat_input(
+            "Écrire un message dans ce salon privé...",
+            key=f"chat_input_{room_id}",
+        )
+        if nouveau_texte and nouveau_texte.strip():
+            if append_message(
+                df_messages, room_id, user_email, user_full_name, nouveau_texte
+            ):
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# 7. CHARGEMENT DES DONNÉES & BARRE LATÉRALE (PROFIL ÉTUDIANT + ADMIN)
 # ---------------------------------------------------------------------------
 df_utilisateurs = load_utilisateurs()
 df_demandes = load_demandes()
 df_messages = load_messages()
 
-current_user = st.session_state.get("user")
-current_user_email = current_user["Email"].strip().lower() if current_user else ""
+all_matchs_binomes = compute_bilateral_matches(df_demandes)
+all_matchs_triangulaires = compute_triangular_matches(df_demandes)
 
-all_matchs_binomes, all_matchs_triangulaires = compute_all_matches(df_demandes)
-mes_matchs_binomes, mes_matchs_triangulaires = get_private_matches_for_user(
+current_user = st.session_state.get("user")
+current_user_email = current_user["Email"].strip().lower() if current_user else None
+
+mes_matchs_binomes, mes_matchs_triangulaires = filter_private_matches_for_user(
     current_user_email, all_matchs_binomes, all_matchs_triangulaires
 )
 mes_notifications = build_user_notifications(
     current_user_email, mes_matchs_binomes, mes_matchs_triangulaires, df_messages
 )
 
-# ---------------------------------------------------------------------------
-# 7. BARRE LATÉRALE : AUTHENTIFICATION, PROFIL & MENTIONS
-# ---------------------------------------------------------------------------
 with st.sidebar:
-    st.title("PermutStage")
-    st.caption("Médecine UCLouvain — P3 à P8")
-    st.divider()
-
     st.subheader("Mon Compte Étudiant")
-
     if current_user is not None:
         st.success(
             f"Connecté : **{current_user['Prenom']} {current_user['Nom']}**\n\n`{current_user['Email']}`"
@@ -659,54 +831,47 @@ with st.sidebar:
 
         with st.expander("🔒 Modifier mon code PIN", expanded=False):
             with st.form("sidebar_change_pin_form"):
-                old_pin_in = st.text_input(
-                    "Code PIN actuel", type="password", max_chars=4
+                old_pin_val = st.text_input(
+                    "Ancien code PIN", type="password", max_chars=4
                 )
-                new_pin_in = st.text_input(
-                    "Nouveau code PIN", type="password", max_chars=4
+                new_pin_val = st.text_input(
+                    "Nouveau code PIN (4 chiffres)", type="password", max_chars=4
                 )
-                conf_pin_in = st.text_input(
+                confirm_pin_val = st.text_input(
                     "Confirmer le nouveau code PIN", type="password", max_chars=4
                 )
-                btn_save_pin = st.form_submit_button(
-                    "Mettre à jour mon code PIN", use_container_width=True
+                btn_save_new_pin = st.form_submit_button(
+                    "Modifier mon code PIN", type="primary", use_container_width=True
                 )
 
-                if btn_save_pin:
-                    old_c = old_pin_in.strip()
-                    new_c = new_pin_in.strip()
-                    conf_c = conf_pin_in.strip()
+                if btn_save_new_pin:
+                    o_clean = old_pin_val.strip()
+                    n_clean = new_pin_val.strip()
+                    c_clean = confirm_pin_val.strip()
+                    current_pin = str(current_user.get("PIN", "")).strip().zfill(4)
 
-                    expected_cur_pin = str(current_user.get("PIN", "")).strip()
-
-                    if old_c != expected_cur_pin:
-                        st.error("Le code PIN actuel est incorrect.")
-                    elif not re.match(r"^\d{4}$", new_c):
+                    if o_clean != current_pin:
+                        st.error("L'ancien code PIN saisi est incorrect.")
+                    elif not re.match(r"^\d{4}$", n_clean):
                         st.error("Le nouveau code PIN doit comporter exactement 4 chiffres.")
-                    elif new_c != conf_c:
-                        st.error("Le nouveau code PIN et sa confirmation ne correspondent pas.")
+                    elif n_clean != c_clean:
+                        st.error("La confirmation ne correspond pas au nouveau code PIN.")
                     else:
-                        u_idx = df_utilisateurs[
-                            df_utilisateurs["Email"].str.lower() == current_user_email
-                        ].index
-                        if not u_idx.empty:
-                            df_utilisateurs.loc[u_idx, "PIN"] = new_c
-                            save_utilisateurs(df_utilisateurs)
-
-                        dem_idx = df_demandes[
-                            df_demandes["Email"].str.lower() == current_user_email
-                        ].index
-                        if not dem_idx.empty:
-                            df_demandes.loc[dem_idx, "PIN"] = new_c
-                            save_demandes(df_demandes)
-
-                        st.session_state["user"]["PIN"] = new_c
-                        st.success("Votre code PIN a été mis à jour avec succès !")
-                        st.rerun()
+                        mask_u = df_utilisateurs["Email"].str.lower() == current_user_email
+                        if mask_u.any():
+                            df_utilisateurs.loc[mask_u, "PIN"] = n_clean
+                            if save_utilisateurs(df_utilisateurs):
+                                if not df_demandes.empty:
+                                    mask_d = df_demandes["Email"].str.lower() == current_user_email
+                                    if mask_d.any():
+                                        df_demandes.loc[mask_d, "PIN"] = n_clean
+                                        save_demandes(df_demandes)
+                                st.session_state["user"]["PIN"] = n_clean
+                                st.success("Votre code PIN a été modifié avec succès !")
+                                st.rerun()
 
         if st.button("Se déconnecter", use_container_width=True):
             st.session_state["user"] = None
-            st.session_state["is_admin"] = False
             st.rerun()
     else:
         auth_tabs = st.tabs(["Connexion", "Créer un compte"])
@@ -989,70 +1154,73 @@ with tab0:
             <p style="color: #e0e7ff; margin: 0 0 1.25rem 0; font-size: 1rem; line-height: 1.6; max-width: 850px;">
                 Bienvenue sur <strong>PermutStage</strong>, la plateforme pensée pour fluidifier, simplifier et centraliser
                 les échanges de lieux de stages hospitaliers entre camarades de promotion. Vos souhaits sont analysés
-                en continu pour trouver les meilleures permutations bilatérales ou triangulaires, dans le respect
-                strict de votre vie privée.
+                en temps réel par notre algorithme de permutation, dans le respect le plus strict de votre confidentialité.
             </p>
-            <div style="background: rgba(255, 255, 255, 0.1); border-left: 4px solid #60a5fa; padding: 0.85rem 1.1rem; border-radius: 6px; font-size: 0.88rem; line-height: 1.5; color: #f8fafc;">
-                <strong>💡 Version Alpha / Concept Test :</strong> Cet outil a été développé bénévolement par et pour les étudiants afin d'éliminer les annonces éparpillées sur les réseaux sociaux. Merci pour votre bienveillance, vos retours et vos suggestions pour améliorer continuellement la plateforme !
+            <div style="background: rgba(255, 255, 255, 0.1); border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 10px; padding: 0.9rem 1.1rem; font-size: 0.88rem; color: #f8fafc; line-height: 1.5;">
+                <strong style="color: #fde047;">🤝 Statut du projet : Version Alpha / Concept Test</strong><br/>
+                Cette plateforme est une initiative bénévole conçue <em>par et pour les étudiants</em>. Merci pour votre
+                bienveillance et vos retours constructifs pour faire évoluer l'outil au service de toute la promotion !
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    st.markdown("### 🧭 Comment ça marche ? (Parcours en 4 étapes)")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
+    # 2. Fonctionnement pas-à-pas
+    st.subheader("🧭 Comment ça marche ? (Le parcours en 4 étapes simples)")
+    col_e1, col_e2, col_e3, col_e4 = st.columns(4)
+
+    with col_e1:
         st.markdown(
             """
-            <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 1.2rem; height: 100%;">
-                <div style="font-size: 1.8rem; margin-bottom: 0.5rem;">👤</div>
-                <div style="font-size: 0.82rem; font-weight: 700; color: #1e3a8a; text-transform: uppercase;">Étape 1</div>
-                <h4 style="margin: 0.2rem 0 0.5rem 0; font-size: 1rem; font-weight: 700; color: #0f172a;">Profil en 30s</h4>
-                <p style="font-size: 0.85rem; color: #475569; margin: 0; line-height: 1.45;">
-                    Créez votre compte avec votre nom, prénom, email institutionnel et un simple <strong>code PIN à 4 chiffres</strong>.
+            <div style="background: white; border: 1px solid #e2e8f0; border-radius: 10px; padding: 1rem; min-height: 190px;">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: #dbeafe; color: #1e40af; font-weight: 800; display: flex; align-items: center; justify-content: center; margin-bottom: 0.5rem;">1</div>
+                <strong style="color: #0f172a; font-size: 0.95rem;">Créer son profil (30s)</strong>
+                <p style="color: #475569; font-size: 0.82rem; margin-top: 0.35rem; line-height: 1.4;">
+                    Renseignez vos nom, prénom, email institutionnel et un <strong>code PIN à 4 chiffres</strong>.
+                    Pas de mot de passe complexe à mémoriser.
                 </p>
             </div>
             """,
             unsafe_allow_html=True,
         )
-    with c2:
+
+    with col_e2:
         st.markdown(
             """
-            <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 1.2rem; height: 100%;">
-                <div style="font-size: 1.8rem; margin-bottom: 0.5rem;">📝</div>
-                <div style="font-size: 0.82rem; font-weight: 700; color: #1e3a8a; text-transform: uppercase;">Étape 2</div>
-                <h4 style="margin: 0.2rem 0 0.5rem 0; font-size: 1rem; font-weight: 700; color: #0f172a;">Déposez votre offre</h4>
-                <p style="font-size: 0.85rem; color: #475569; margin: 0; line-height: 1.45;">
-                    Renseignez votre période, spécialité, hôpital attribué et sélectionnez un ou plusieurs hôpitaux souhaités.
+            <div style="background: white; border: 1px solid #e2e8f0; border-radius: 10px; padding: 1rem; min-height: 190px;">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: #e0e7ff; color: #3730a3; font-weight: 800; display: flex; align-items: center; justify-content: center; margin-bottom: 0.5rem;">2</div>
+                <strong style="color: #0f172a; font-size: 0.95rem;">Déposer son offre</strong>
+                <p style="color: #475569; font-size: 0.82rem; margin-top: 0.35rem; line-height: 1.4;">
+                    Indiquez votre stage actuel (période P3 à P8, spécialité, hôpital) et sélectionnez vos <strong>hôpitaux souhaités</strong> par région.
                 </p>
             </div>
             """,
             unsafe_allow_html=True,
         )
-    with c3:
+
+    with col_e3:
         st.markdown(
             """
-            <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 1.2rem; height: 100%;">
-                <div style="font-size: 1.8rem; margin-bottom: 0.5rem;">⚡</div>
-                <div style="font-size: 0.82rem; font-weight: 700; color: #1e3a8a; text-transform: uppercase;">Étape 3</div>
-                <h4 style="margin: 0.2rem 0 0.5rem 0; font-size: 1rem; font-weight: 700; color: #0f172a;">Matching automatique</h4>
-                <p style="font-size: 0.85rem; color: #475569; margin: 0; line-height: 1.45;">
-                    L'algorithme compare les souhaits et détecte instantanément les binômes directs ou les boucles triangulaires compatibles.
+            <div style="background: white; border: 1px solid #e2e8f0; border-radius: 10px; padding: 1rem; min-height: 190px;">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: #f3e8ff; color: #6b21a8; font-weight: 800; display: flex; align-items: center; justify-content: center; margin-bottom: 0.5rem;">3</div>
+                <strong style="color: #0f172a; font-size: 0.95rem;">Calcul des matchs</strong>
+                <p style="color: #475569; font-size: 0.82rem; margin-top: 0.35rem; line-height: 1.4;">
+                    L'algorithme détecte en continu les <strong>échanges directs à deux (A ↔ B)</strong> ou les <strong>boucles triangulaires (A → B → C → A)</strong>.
                 </p>
             </div>
             """,
             unsafe_allow_html=True,
         )
-    with c4:
+
+    with col_e4:
         st.markdown(
             """
-            <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 1.2rem; height: 100%;">
-                <div style="font-size: 1.8rem; margin-bottom: 0.5rem;">💬</div>
-                <div style="font-size: 0.82rem; font-weight: 700; color: #1e3a8a; text-transform: uppercase;">Étape 4</div>
-                <h4 style="margin: 0.2rem 0 0.5rem 0; font-size: 1rem; font-weight: 700; color: #0f172a;">Salons privés & Email</h4>
-                <p style="font-size: 0.85rem; color: #475569; margin: 0; line-height: 1.45;">
-                    Dès qu'un match se produit, une alerte email est envoyée et un salon privé sécurisé s'ouvre pour vous accorder.
+            <div style="background: white; border: 1px solid #e2e8f0; border-radius: 10px; padding: 1rem; min-height: 190px;">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: #dcfce7; color: #166534; font-weight: 800; display: flex; align-items: center; justify-content: center; margin-bottom: 0.5rem;">4</div>
+                <strong style="color: #0f172a; font-size: 0.95rem;">Échanger en privé</strong>
+                <p style="color: #475569; font-size: 0.82rem; margin-top: 0.35rem; line-height: 1.4;">
+                    Dès qu'un cycle se forme, une notification cloche et un <strong>email d'alerte</strong> s'activent pour ouvrir votre salon privé sécurisé.
                 </p>
             </div>
             """,
@@ -1060,363 +1228,327 @@ with tab0:
         )
 
     st.write("")
-    col_regles, col_secu = st.columns(2)
+    col_regles, col_rgpd = st.columns(2)
 
+    # 3. Règles & Conditions d'Échange
     with col_regles:
+        st.subheader("⚖️ Les Règles & Conditions d'Échange")
         st.markdown(
             """
-            <div style="background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 12px; padding: 1.3rem;">
-                <h3 style="margin-top: 0; color: #0f172a; font-size: 1.1rem; display: flex; items-center; gap: 0.5rem;">
-                    ⚖️ Règles et Conditions d'Échange
-                </h3>
-                <ul style="font-size: 0.88rem; color: #334155; line-height: 1.6; margin-bottom: 0; padding-left: 1.2rem;">
-                    <li><strong>Même période obligatoire :</strong> P3 ne peut permuter qu'avec P3, P4 avec P4, etc.</li>
-                    <li><strong>Même spécialité obligatoire :</strong> Pédiatrie contre Pédiatrie, Urgences contre Urgences.</li>
-                    <li><strong>Une seule offre par période :</strong> Vous pouvez déposer plusieurs offres tant qu'elles concernent des périodes distinctes.</li>
-                    <li><strong>Validation facultaire ultérieure :</strong> La plateforme permet de trouver un accord mutuel. Une fois le binôme confirmé, la procédure officielle de demande de permutation auprès de la commission facultaire des stages reste obligatoire.</li>
-                </ul>
-            </div>
-            """,
-            unsafe_allow_html=True,
+            * **Même période obligatoire :** Une permutation n'est possible qu'au sein d'une même tranche chronologique (ex. P3 contre P3, P4 contre P4).
+            * **Même spécialité obligatoire :** Condition sine qua non : Pédiatrie contre Pédiatrie, Chirurgie contre Chirurgie, etc. Seul l'hôpital d'affectation change.
+            * **Validation facultaire ultérieure :** PermutStage permet de trouver et finaliser un accord mutuel de principe. Une fois votre binôme ou triangle confirmé dans le salon privé, la démarche officielle auprès de la **coordination / commission des stages** demeure requise selon le règlement facultaire.
+            """
         )
 
-    with col_secu:
+    # 4. Confidentialité & Protection des Données Personnelles
+    with col_rgpd:
+        st.subheader("🔒 Confidentialité & Respect de la Vie Privée")
         st.markdown(
             """
-            <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 12px; padding: 1.3rem;">
-                <h3 style="margin-top: 0; color: #166534; font-size: 1.1rem; display: flex; items-center; gap: 0.5rem;">
-                    🛡️ Confidentialité & Protection des Données
-                </h3>
-                <ul style="font-size: 0.88rem; color: #14532d; line-height: 1.6; margin-bottom: 0; padding-left: 1.2rem;">
-                    <li><strong>Authentification minimale :</strong> Pas de mot de passe complexe, connexion rapide par code PIN personnel à 4 chiffres.</li>
-                    <li><strong>Minimisation stricte :</strong> Seules les données indispensables à la logistique du stage sont collectées.</li>
-                    <li><strong>Salons 100 % confidentiels :</strong> Les annonces en négociation et les messageries privées ne sont visibles <em>que</em> par les étudiants directement concernés par le match.</li>
-                    <li><strong>Aucune visibilité tierce :</strong> Aucun tiers ne peut savoir qui échange avec qui.</li>
-                </ul>
-            </div>
-            """,
-            unsafe_allow_html=True,
+            * **Authentification minimale par code PIN :** Pas de stockage de mots de passe sensibles. Vos coordonnées sont protégées par votre email institutionnel et un PIN personnel à 4 chiffres.
+            * **Minimisation stricte des données :** Seules les informations strictement indispensables à la logistique de permutation sont traitées.
+            * **Matching 100 % privé et hermétique :** Les autres camarades de promotion ne voient **jamais** qui permute avec qui. Seuls les étudiants directement concernés par un cycle complet ont accès aux coordonnées et aux salons de discussion.
+            """
         )
 
     st.write("")
-    st.info("Prêt à débuter ? Connectez-vous via le menu latéral ou rendez-vous sur l'onglet **'1. Déposer une demande'** pour soumettre vos souhaits.")
+    st.divider()
+
+    # 5. Appel à l'action (Call-to-Action)
+    st.markdown("### 🚀 Prêt(e) à trouver votre permutation ?")
+    c_btn1, c_btn2, _ = st.columns([1.5, 1.5, 3])
+    with c_btn1:
+        if current_user is None:
+            st.info("👈 Créez votre profil ou connectez-vous dans la barre latérale pour démarrer.")
+        else:
+            st.success(f"Connecté en tant que {current_user['Prenom']} {current_user['Nom']}. Déposez votre offre dans l'onglet 1 !")
 
 # ===========================================================================
-# ONGLET 1 : DÉPOSER UNE DEMANDE
+# ONGLET 1 : DÉPOSER UNE DEMANDE (COORDONNÉES VERROUILLÉES SUR LE COMPTE)
 # ===========================================================================
 with tab1:
-    st.subheader("Déposer une offre d'échange de stage")
+    st.subheader("Déposer une nouvelle demande de permutation")
 
     if current_user is None:
         st.warning(
-            "🔒 Vous devez être connecté à votre compte étudiant pour déposer une annonce. "
-            "Créez ou connectez votre compte dans la barre latérale gauche."
+            "🔒 Veuillez vous connecter ou créer un compte étudiant dans le menu latéral gauche pour déposer une demande de permutation."
         )
     else:
-        st.caption(f"Offre déposée sous l'identité : **{current_user['Prenom']} {current_user['Nom']}** (`{current_user['Email']}`)")
+        nom_complet_verrouille = f"{current_user['Prenom']} {current_user['Nom']}".strip()
+        email_verrouille = current_user["Email"].strip().lower()
 
-        with st.form("form_depot_demande", clear_on_submit=True):
-            col_form_1, col_form_2 = st.columns(2)
-            with col_form_1:
-                sel_periode = st.selectbox("Période *", options=PERIODES)
-                sel_spec = st.selectbox("Spécialité *", options=SPECIALITES)
-            with col_form_2:
-                sel_hopital_actuel = st.selectbox(
-                    "Hôpital actuel attribué *",
-                    options=TOUS_LES_HOPITAUX,
-                    format_func=lambda h: f"[{HOPITAL_VERS_REGION.get(h, '')}] {h}",
+        st.markdown("##### Sélection géographique par région")
+        reg_col1, reg_col2 = st.columns(2)
+        with reg_col1:
+            region_actuel_filtre = st.selectbox(
+                "Filtrer la liste de l'hôpital actuel par région",
+                options=["Toutes les régions"] + REGIONS,
+            )
+        with reg_col2:
+            regions_souhaitees_auto = st.multiselect(
+                "Pré-sélectionner tous les hôpitaux souhaités d'une ou plusieurs régions",
+                options=REGIONS,
+            )
+
+        options_hopital_actuel = (
+            TOUS_LES_HOPITAUX
+            if region_actuel_filtre == "Toutes les régions"
+            else HOPITAUX_PAR_REGION[region_actuel_filtre]
+        )
+
+        hopitaux_preselectionnes = []
+        for reg in regions_souhaitees_auto:
+            for h in HOPITAUX_PAR_REGION[reg]:
+                if h not in hopitaux_preselectionnes:
+                    hopitaux_preselectionnes.append(h)
+
+        with st.form("form_depot_demande", clear_on_submit=False):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.text_input(
+                    "Nom & Prénom (verrouillé sur votre profil)",
+                    value=nom_complet_verrouille,
+                    disabled=True,
+                )
+                st.text_input(
+                    "Email institutionnel (verrouillé sur votre profil)",
+                    value=email_verrouille,
+                    disabled=True,
                 )
 
-            st.markdown("#### Hôpitaux souhaités en échange *")
-            sel_hopitaux_souhaites = st.multiselect(
-                "Sélectionnez un ou plusieurs lieux souhaités :",
+            with col2:
+                periode = st.selectbox("Période de stage *", options=PERIODES)
+                specialite = st.selectbox("Spécialité *", options=SPECIALITES)
+                hopital_actuel = st.selectbox(
+                    "Hôpital actuel *", options=options_hopital_actuel
+                )
+
+            defaut_souhaites = [
+                h for h in hopitaux_preselectionnes if h != hopital_actuel
+            ]
+
+            hopitaux_souhaites = st.multiselect(
+                "Hôpitaux souhaités *",
                 options=TOUS_LES_HOPITAUX,
+                default=defaut_souhaites,
                 format_func=lambda h: f"[{HOPITAL_VERS_REGION.get(h, '')}] {h}",
-                placeholder="Choisissez vos hôpitaux souhaités...",
             )
 
-            btn_submit_demande = st.form_submit_button(
-                "Publier mon offre d'échange", type="primary", use_container_width=True
+            submitted = st.form_submit_button(
+                "Publier ma demande de permutation",
+                type="primary",
+                use_container_width=True,
             )
 
-            if btn_submit_demande:
-                form_errors = []
-                if not sel_hopitaux_souhaites:
-                    form_errors.append("Veuillez choisir au moins un hôpital souhaité.")
-                if sel_hopital_actuel in sel_hopitaux_souhaites:
-                    form_errors.append("L'hôpital actuel attribué ne peut pas figurer dans votre liste de souhaits.")
-
-                if (
-                    not df_demandes.empty
-                    and not df_demandes[
-                        (df_demandes["Email"].str.lower() == current_user_email)
-                        & (df_demandes["Periode"] == sel_periode)
-                    ].empty
-                ):
-                    form_errors.append(
-                        f"Vous avez déjà déposé une offre active pour la période {sel_periode}. "
-                        "Rendez-vous dans l'onglet '4. Gérer mon offre' pour la modifier."
+            if submitted:
+                erreurs = []
+                if not hopitaux_souhaites:
+                    erreurs.append("Veuillez sélectionner au moins un hôpital souhaité.")
+                elif hopital_actuel in hopitaux_souhaites:
+                    erreurs.append(
+                        "Validation refusée : votre hôpital actuel ne peut pas figurer dans la liste des hôpitaux souhaités."
                     )
 
-                if form_errors:
-                    for e in form_errors:
-                        st.error(e)
+                if not df_demandes.empty:
+                    doublon = df_demandes[
+                        (df_demandes["Email"].str.lower() == email_verrouille)
+                        & (df_demandes["Periode"] == periode)
+                    ]
+                    if not doublon.empty:
+                        erreurs.append(
+                            f"Vous avez déjà une demande active sur la période {periode}. "
+                            "Modifiez-la ou supprimez-la dans l'onglet 'Gérer mon offre'."
+                        )
+
+                if erreurs:
+                    for err in erreurs:
+                        st.error(err)
                 else:
-                    anciens_rooms = {m["room_id"] for m in all_matchs_binomes} | {
-                        t["room_id"] for t in all_matchs_triangulaires
-                    }
+                    # Mémoriser les Room_IDs existants avant ajout pour détecter les NOUVEAUX matchs
+                    anciens_rooms = {
+                        m["room_id"] for m in all_matchs_binomes
+                    } | {t["room_id"] for t in all_matchs_triangulaires}
 
-                    nouvelle_demande = {
-                        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "Nom": f"{current_user['Prenom']} {current_user['Nom']}",
-                        "Email": current_user["Email"],
-                        "PIN": current_user["PIN"],
-                        "Periode": sel_periode,
-                        "Specialite": sel_spec,
-                        "Hopital_Actuel": sel_hopital_actuel,
-                        "Hopitaux_Souhaites": serialize_hospitals(sel_hopitaux_souhaites),
-                    }
-                    df_demandes_maj = pd.concat(
-                        [df_demandes, pd.DataFrame([nouvelle_demande])],
-                        ignore_index=True,
+                    nouvelle_demande = pd.DataFrame(
+                        [
+                            {
+                                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "Nom": nom_complet_verrouille,
+                                "Email": email_verrouille,
+                                "PIN": str(current_user.get("PIN", "")).strip(),
+                                "Periode": periode,
+                                "Specialite": specialite,
+                                "Hopital_Actuel": hopital_actuel,
+                                "Hopitaux_Souhaites": serialize_hospitals(
+                                    hopitaux_souhaites
+                                ),
+                            }
+                        ]
                     )
-                    if save_demandes(df_demandes_maj):
+                    df_maj = pd.concat(
+                        [df_demandes, nouvelle_demande], ignore_index=True
+                    )
+                    if save_demandes(df_maj):
+                        # Vérifier uniquement les nouveaux cycles complets (bilatéraux ou triangulaires)
                         trigger_new_match_emails(
                             anciens_rooms=anciens_rooms,
-                            df_demandes_maj=df_demandes_maj,
+                            df_demandes_maj=df_maj,
                             df_utilisateurs=df_utilisateurs,
                             df_messages=df_messages,
                         )
+
                         st.success(
-                            f"Votre offre pour la période {sel_periode} ({sel_spec}) a été enregistrée avec succès !"
+                            f"Votre demande pour la période {periode} ({specialite}) a été publiée !"
                         )
                         st.rerun()
 
 # ===========================================================================
-# ONGLET 2 : MATCHS PRIVÉS & SALONS DE DISCUSSION CONFIDENTIELS
+# ONGLET 2 : MATCHS DISPONIBLES & SALONS PRIVÉS (CONFIDENTIALITÉ STRICTE)
 # ===========================================================================
 with tab2:
-    st.subheader("Mes Matchs Disponibles & Salons Privés")
+    st.subheader("Mes correspondances privées & Salons de discussion")
 
     if current_user is None:
-        st.warning(
-            "🔒 Cet espace est strictement confidentiel. "
-            "Connectez-vous avec votre compte étudiant pour consulter vos correspondances."
+        st.info(
+            "🔒 **Confidentialité stricte des échanges** : Vous devez être connecté à votre compte étudiant "
+            "pour visualiser vos propositions d'échange et accéder à vos salons de discussion privés. "
+            "Aucun étudiant tiers ne peut voir les échanges des autres."
         )
     else:
-        st.markdown(
-            f"""
-            <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.85rem 1.15rem; margin-bottom: 1rem; font-size: 0.88rem; color: #334155;">
-                Connecté sous <strong>{current_user['Prenom']} {current_user['Nom']}</strong> (<code>{current_user['Email']}</code>).
-                Seuls vos matchs directs ou triangulaires sont affichés ci-dessous.
-            </div>
-            """,
-            unsafe_allow_html=True,
+        st.caption(
+            f"Affichage strictement filtré pour **{current_user['Prenom']} {current_user['Nom']}** (`{current_user['Email']}`). "
+            "Seuls les binômes et cycles à 3 dont vous faites partie intégrante apparaissent ici."
         )
 
-        total_matchs_user = len(mes_matchs_binomes) + len(mes_matchs_triangulaires)
+        col_bi, col_tri = st.columns(2)
 
-        if total_matchs_user == 0:
-            st.info(
-                "Aucun match direct ou triangulaire ne correspond à vos souhaits pour le moment. "
-                "Dès qu'un autre étudiant dépose une offre compatible, vous recevrez une notification et un email automatique !"
+        with col_bi:
+            st.markdown(
+                f"### Mes Échanges Bilatéraux — Binômes ({len(mes_matchs_binomes)})"
             )
-        else:
-            if mes_matchs_binomes:
-                st.markdown(f"#### 🤝 Échanges directs binômes ({len(mes_matchs_binomes)})")
-                for idx_m, m in enumerate(mes_matchs_binomes):
-                    u1 = m["user1"]
-                    u2 = m["user2"]
-                    est_u1 = u1["Email"].strip().lower() == current_user_email
-                    moi = u1 if est_u1 else u2
-                    partenaire = u2 if est_u1 else u1
-
+            if not mes_matchs_binomes:
+                st.info("Aucun match bilatéral ne vous concerne actuellement.")
+            else:
+                for m in mes_matchs_binomes:
+                    a, b = m["a"], m["b"]
                     st.markdown(
                         f"""
                         <div class="match-card">
-                            <div style="font-weight: 700; color: #166534; font-size: 1.05rem;">
-                                Match Direct · {m['periode']} · {m['specialite']}
+                            <div style="font-weight: 700; color: #166534; margin-bottom: 0.4rem;">
+                                MATCH PRIVÉ BILATÉRAL · {m['periode']} · {m['specialite']}
                             </div>
-                            <div style="margin-top: 0.4rem; font-size: 0.92rem; color: #1e293b;">
-                                <strong>Votre stage actuel :</strong> {moi['Hopital_Actuel']}<br/>
-                                <strong>Stage obtenu en échange :</strong> {partenaire['Hopital_Actuel']} (proposé par <strong>{partenaire['Nom']}</strong>)
-                            </div>
+                            <p style="margin: 0.25rem 0;">
+                                <strong>{a['Nom']}</strong> ({a['Hopital_Actuel']})
+                                &nbsp;&lt;-&gt;&nbsp;
+                                <strong>{b['Nom']}</strong> ({b['Hopital_Actuel']})
+                            </p>
+                            <p style="margin: 0.4rem 0 0 0; font-size: 0.85rem; color: #15803d;">
+                                Coordonnées réservées aux participants :
+                                <a href="mailto:{a['Email']}">{a['Email']}</a> |
+                                <a href="mailto:{b['Email']}">{b['Email']}</a>
+                            </p>
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
+                    render_private_chat_room(
+                        room_id=m["room_id"],
+                        current_user=current_user,
+                        df_messages=df_messages,
+                        label_expander=f"Salon privé binôme ({m['periode']} · {m['specialite']})",
+                    )
 
-                    with st.expander(
-                        f"💬 Ouvrir le Salon Privé avec {partenaire['Nom']} (Room: {m['room_id'][:28]}...)",
-                        expanded=True,
-                    ):
-                        room_id = m["room_id"]
-                        msgs_room = df_messages[df_messages["Room_ID"] == room_id]
-
-                        if msgs_room.empty:
-                            st.caption("Aucun message échangé pour le moment. Saluez votre camarade !")
-                        else:
-                            for _, msg_row in msgs_room.iterrows():
-                                is_me = msg_row["Sender_Email"].strip().lower() == current_user_email
-                                align = "right" if is_me else "left"
-                                bg_color = "#eff6ff" if is_me else "#f1f5f9"
-                                border_col = "#bfdbfe" if is_me else "#e2e8f0"
-                                label_sender = "Vous" if is_me else msg_row["Sender_Name"]
-
-                                st.markdown(
-                                    f"""
-                                    <div style="text-align: {align}; margin-bottom: 0.5rem;">
-                                        <div style="display: inline-block; background-color: {bg_color}; border: 1px solid {border_col}; border-radius: 8px; padding: 0.5rem 0.85rem; max-width: 75%; text-align: left;">
-                                            <div style="font-size: 0.75rem; font-weight: 700; color: #1e3a8a;">
-                                                {label_sender} · <span style="color: #64748b; font-weight: 400;">{msg_row['Timestamp']}</span>
-                                            </div>
-                                            <div style="font-size: 0.88rem; color: #0f172a; margin-top: 0.2rem;">
-                                                {msg_row['Texte']}
-                                            </div>
-                                        </div>
-                                    </div>
-                                    """,
-                                    unsafe_allow_html=True,
-                                )
-
-                        with st.form(f"msg_form_binome_{idx_m}", clear_on_submit=True):
-                            texte_input = st.text_input(
-                                "Écrire un message privé",
-                                placeholder="Bonjour, es-tu d'accord pour qu'on échange nos stages ?",
-                                key=f"input_b_{idx_m}",
-                            )
-                            btn_send = st.form_submit_button("Envoyer dans le salon privé")
-                            if btn_send:
-                                txt_c = texte_input.strip()
-                                if txt_c:
-                                    nouveau_message = {
-                                        "Message_ID": f"MSG_{uuid.uuid4().hex[:8].upper()}",
-                                        "Room_ID": room_id,
-                                        "Sender_Email": current_user["Email"],
-                                        "Sender_Name": f"{current_user['Prenom']} {current_user['Nom']}",
-                                        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                        "Texte": txt_c,
-                                    }
-                                    df_messages_maj = pd.concat(
-                                        [df_messages, pd.DataFrame([nouveau_message])],
-                                        ignore_index=True,
-                                    )
-                                    if save_messages(df_messages_maj):
-                                        st.rerun()
-
-            if mes_matchs_triangulaires:
-                st.markdown(f"#### 🔄 Échanges en boucle triangulaire ({len(mes_matchs_triangulaires)})")
-                for idx_t, t in enumerate(mes_matchs_triangulaires):
-                    u1 = t["user1"]
-                    u2 = t["user2"]
-                    u3 = t["user3"]
+        with col_tri:
+            st.markdown(
+                f"### Mes Salons Triangulaires — Cycles à 3 ({len(mes_matchs_triangulaires)})"
+            )
+            if not mes_matchs_triangulaires:
+                st.info("Aucun cycle triangulaire à 3 personnes ne vous concerne actuellement.")
+            else:
+                for t in mes_matchs_triangulaires:
+                    a, b, c = t["a"], t["b"], t["c"]
                     st.markdown(
                         f"""
                         <div class="tri-card">
-                            <div style="font-weight: 700; color: #065f46; font-size: 1.05rem;">
-                                Boucle Triangulaire · {t['periode']} · {t['specialite']}
+                            <div style="font-weight: 700; color: #065f46; margin-bottom: 0.4rem;">
+                                MATCH PRIVÉ TRIANGULAIRE · {t['periode']} · {t['specialite']}
                             </div>
-                            <div style="margin-top: 0.4rem; font-size: 0.92rem; color: #1e293b;">
-                                <strong>Cycle d'affectation :</strong><br/>
-                                • <strong>{u1['Nom']}</strong> cède <em>{u1['Hopital_Actuel']}</em> à <strong>{u3['Nom']}</strong><br/>
-                                • <strong>{u2['Nom']}</strong> cède <em>{u2['Hopital_Actuel']}</em> à <strong>{u1['Nom']}</strong><br/>
-                                • <strong>{u3['Nom']}</strong> cède <em>{u3['Hopital_Actuel']}</em> à <strong>{u2['Nom']}</strong>
-                            </div>
+                            <p style="margin: 0.35rem 0; font-size: 0.92rem; line-height: 1.5;">
+                                <strong>{a['Nom']}</strong> ({a['Hopital_Actuel']})
+                                &nbsp;-&gt;&nbsp;
+                                <strong>{b['Nom']}</strong> ({b['Hopital_Actuel']})
+                                &nbsp;-&gt;&nbsp;
+                                <strong>{c['Nom']}</strong> ({c['Hopital_Actuel']})
+                                &nbsp;-&gt;&nbsp;
+                                <strong>{a['Nom']}</strong>
+                            </p>
+                            <p style="margin: 0.4rem 0 0 0; font-size: 0.85rem; color: #047857;">
+                                Coordonnées réservées au cycle :
+                                <a href="mailto:{a['Email']}">{a['Email']}</a> ·
+                                <a href="mailto:{b['Email']}">{b['Email']}</a> ·
+                                <a href="mailto:{c['Email']}">{c['Email']}</a>
+                            </p>
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
-
-                    with st.expander(
-                        f"💬 Ouvrir le Salon Tripartite Privé (Room: {t['room_id'][:28]}...)",
-                        expanded=True,
-                    ):
-                        room_id_tri = t["room_id"]
-                        msgs_tri_room = df_messages[df_messages["Room_ID"] == room_id_tri]
-
-                        if msgs_tri_room.empty:
-                            st.caption("Aucun message dans ce salon tripartite pour l'instant.")
-                        else:
-                            for _, msg_row in msgs_tri_room.iterrows():
-                                is_me = msg_row["Sender_Email"].strip().lower() == current_user_email
-                                align = "right" if is_me else "left"
-                                bg_color = "#ecfdf5" if is_me else "#f1f5f9"
-                                border_col = "#a7f3d0" if is_me else "#e2e8f0"
-                                label_sender = "Vous" if is_me else msg_row["Sender_Name"]
-
-                                st.markdown(
-                                    f"""
-                                    <div style="text-align: {align}; margin-bottom: 0.5rem;">
-                                        <div style="display: inline-block; background-color: {bg_color}; border: 1px solid {border_col}; border-radius: 8px; padding: 0.5rem 0.85rem; max-width: 75%; text-align: left;">
-                                            <div style="font-size: 0.75rem; font-weight: 700; color: #065f46;">
-                                                {label_sender} · <span style="color: #64748b; font-weight: 400;">{msg_row['Timestamp']}</span>
-                                            </div>
-                                            <div style="font-size: 0.88rem; color: #0f172a; margin-top: 0.2rem;">
-                                                {msg_row['Texte']}
-                                            </div>
-                                        </div>
-                                    </div>
-                                    """,
-                                    unsafe_allow_html=True,
-                                )
-
-                        with st.form(f"msg_form_tri_{idx_t}", clear_on_submit=True):
-                            texte_tri_input = st.text_input(
-                                "Écrire au groupe tripartite",
-                                placeholder="Bonjour à tous les deux, validons-nous cette boucle ?",
-                                key=f"input_t_{idx_t}",
-                            )
-                            btn_send_tri = st.form_submit_button("Envoyer dans le salon tripartite")
-                            if btn_send_tri:
-                                txt_c = texte_tri_input.strip()
-                                if txt_c:
-                                    nouveau_message = {
-                                        "Message_ID": f"MSG_{uuid.uuid4().hex[:8].upper()}",
-                                        "Room_ID": room_id_tri,
-                                        "Sender_Email": current_user["Email"],
-                                        "Sender_Name": f"{current_user['Prenom']} {current_user['Nom']}",
-                                        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                        "Texte": txt_c,
-                                    }
-                                    df_messages_maj = pd.concat(
-                                        [df_messages, pd.DataFrame([nouveau_message])],
-                                        ignore_index=True,
-                                    )
-                                    if save_messages(df_messages_maj):
-                                        st.rerun()
+                    render_private_chat_room(
+                        room_id=t["room_id"],
+                        current_user=current_user,
+                        df_messages=df_messages,
+                        label_expander=f"Salon privé triangulaire ({t['periode']} · {t['specialite']})",
+                    )
 
 # ===========================================================================
-# ONGLET 3 : CONSULTER TOUTES LES OFFRES (ANONYMISÉES SANS CONTACT)
+# ONGLET 3 : CONSULTER TOUTES LES OFFRES (ANONYMISÉES PAR CONFIDENTIALITÉ)
 # ===========================================================================
 with tab3:
-    st.subheader(f"Catalogue global des offres disponibles ({len(df_demandes)})")
-    st.caption("Affichage anonymisé respectant la confidentialité : les coordonnées des étudiants n'apparaissent pas publiquement.")
+    st.subheader("Catalogue des offres de stage disponibles")
+    st.caption(
+        "Pour garantir la confidentialité des échanges, seuls les lieux de stage proposés et souhaités sont affichés publiquement. "
+        "Les identités et adresses email ne sont révélées qu'en cas de match mutuel dans votre onglet privé."
+    )
 
-    col_filtre_p, col_filtre_s, col_filtre_r = st.columns(3)
-    with col_filtre_p:
-        f_periode = st.selectbox("Filtrer par Période", options=["Toutes"] + PERIODES)
-    with col_filtre_s:
-        f_specialite = st.selectbox("Filtrer par Spécialité", options=["Toutes"] + SPECIALITES)
-    with col_filtre_r:
-        f_region = st.selectbox("Filtrer par Région de l'hôpital actuel", options=["Toutes"] + REGIONS)
+    f_col1, f_col2, f_col3, f_col4 = st.columns(4)
+    with f_col1:
+        filtre_periode = st.selectbox(
+            "Filtrer par Période", options=["Toutes"] + PERIODES
+        )
+    with f_col2:
+        filtre_specialite = st.selectbox(
+            "Filtrer par Spécialité", options=["Toutes"] + SPECIALITES
+        )
+    with f_col3:
+        filtre_region = st.selectbox(
+            "Filtrer par Région (Hôpital actuel)", options=["Toutes"] + REGIONS
+        )
+    with f_col4:
+        filtre_recherche = st.text_input(
+            "Recherche par hôpital", placeholder="Ex. Saint Luc, Citadelle..."
+        )
 
     df_filtre = df_demandes.copy()
-    if f_periode != "Toutes":
-        df_filtre = df_filtre[df_filtre["Periode"] == f_periode]
-    if f_specialite != "Toutes":
-        df_filtre = df_filtre[df_filtre["Specialite"] == f_specialite]
-    if f_region != "Toutes":
+    if filtre_periode != "Toutes":
+        df_filtre = df_filtre[df_filtre["Periode"] == filtre_periode]
+    if filtre_specialite != "Toutes":
+        df_filtre = df_filtre[df_filtre["Specialite"] == filtre_specialite]
+    if filtre_region != "Toutes":
+        hopitaux_reg = set(HOPITAUX_PAR_REGION[filtre_region])
+        df_filtre = df_filtre[df_filtre["Hopital_Actuel"].isin(hopitaux_reg)]
+    if filtre_recherche.strip():
+        q = filtre_recherche.strip().lower()
         df_filtre = df_filtre[
-            df_filtre["Hopital_Actuel"].apply(lambda h: HOPITAL_VERS_REGION.get(h, "") == f_region)
+            df_filtre["Hopital_Actuel"].str.lower().str.contains(q, na=False)
+            | df_filtre["Hopitaux_Souhaites"].str.lower().str.contains(q, na=False)
         ]
 
     if df_filtre.empty:
-        st.info("Aucune offre ne correspond à ces critères.")
+        st.info("Aucune offre ne correspond aux critères sélectionnés.")
     else:
-        for idx, row in df_filtre.iterrows():
+        for _, row in df_filtre.iterrows():
             souhaites_liste = ", ".join(parse_hospitals(row["Hopitaux_Souhaites"]))
-            region_act = HOPITAL_VERS_REGION.get(row["Hopital_Actuel"], "Région")
-
+            region_act = HOPITAL_VERS_REGION.get(row["Hopital_Actuel"], "Autre")
             st.markdown(
                 f"""
                 <div class="offer-card">
@@ -1524,6 +1656,7 @@ with tab4:
                                         "L'hôpital actuel ne peut pas faire partie des hôpitaux souhaités."
                                     )
 
+                                # Vérifier unicité si changement de période
                                 if new_periode != periode_courante:
                                     conflit = df_demandes[
                                         (df_demandes.index != idx)
