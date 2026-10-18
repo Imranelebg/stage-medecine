@@ -10,7 +10,7 @@ Architecture complète avec base de données Firebase Firestore (firebase-admin)
 - Gestion complète des offres (Modification pré-remplie + Suppression sécurisée)
 - Code PIN oublié (renvoi automatique par email) et modification de PIN
 - Accès Administrateur discret (st.secrets['admin']['password'])
-- Mode d'affichage clair strict verrouillé (aucun mode sombre)
+- Mode d'affichage clair strict verrouillé (accessibilité permanente de la sidebar)
 
 Exécution : streamlit run app.py
 """
@@ -41,7 +41,54 @@ st.markdown(
     @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
 
     /* ==========================================================================
-       1. FORÇAGE STRICT ET PERMANENT DU MODE CLAIR (AUCUN MODE SOMBRE AUTORISÉ)
+       1. RÉTABLISSEMENT & ACCESSIBILITÉ PERMANENTE DE LA BARRE LATÉRALE (SIDEBAR)
+       ========================================================================== */
+    header[data-testid="stHeader"] {
+        background: transparent !important;
+        color: #0f172a !important;
+    }
+
+    /* Masquer uniquement le menu burger et le footer natif (ne jamais masquer le header complet) */
+    #MainMenu {
+        visibility: hidden !important;
+    }
+
+    footer,
+    footer[data-testid="stFooter"] {
+        visibility: hidden !important;
+    }
+
+    /* Masquer les boutons de statut superflus tout en préservant les contrôles */
+    [data-testid="stToolbarActionButton"],
+    [data-testid="stDecoration"],
+    [data-testid="stStatusWidget"],
+    [data-testid="manage-app-button"] {
+        visibility: hidden !important;
+        display: none !important;
+    }
+
+    /* Force la visibilité et l'accessibilité permanente du bouton de déploiement de la sidebar */
+    [data-testid="collapsedControl"] {
+        display: flex !important;
+        visibility: visible !important;
+        color: #0f172a !important;
+        z-index: 999999 !important;
+    }
+
+    [data-testid="collapsedControl"] button {
+        color: #0f172a !important;
+        background-color: #f8fafc !important;
+        border: 1px solid #cbd5e1 !important;
+        border-radius: 8px !important;
+    }
+
+    [data-testid="collapsedControl"] svg {
+        color: #0f172a !important;
+        fill: currentColor !important;
+    }
+
+    /* ==========================================================================
+       2. FORÇAGE DU MODE CLAIR PAR DÉFAUT (FOND #F8FAFC & TEXTE #1E293B)
        ========================================================================== */
     :root,
     [data-theme="dark"],
@@ -52,12 +99,12 @@ st.markdown(
     html,
     body {
         color-scheme: light !important;
-        --background-color: #ffffff !important;
-        --secondary-background-color: #f8fafc !important;
-        --text-color: #0f172a !important;
+        --background-color: #f8fafc !important;
+        --secondary-background-color: #ffffff !important;
+        --text-color: #1e293b !important;
         --primary-color: #1d4ed8 !important;
-        background-color: #ffffff !important;
-        color: #0f172a !important;
+        background-color: #f8fafc !important;
+        color: #1e293b !important;
         font-family: 'Plus Jakarta Sans', sans-serif !important;
     }
 
@@ -78,48 +125,29 @@ st.markdown(
         .main,
         .block-container {
             color-scheme: light !important;
-            --background-color: #ffffff !important;
-            --secondary-background-color: #f8fafc !important;
-            --text-color: #0f172a !important;
+            --background-color: #f8fafc !important;
+            --secondary-background-color: #ffffff !important;
+            --text-color: #1e293b !important;
             --primary-color: #1d4ed8 !important;
-            background-color: #ffffff !important;
-            color: #0f172a !important;
+            background-color: #f8fafc !important;
+            color: #1e293b !important;
         }
 
         [data-testid="stSidebar"],
         [data-testid="stSidebar"] > div,
         [data-testid="stSidebarContent"],
         section[data-testid="stSidebar"] {
-            background-color: #f8fafc !important;
-            color: #0f172a !important;
+            background-color: #ffffff !important;
+            color: #1e293b !important;
         }
-    }
-
-    /* Masquer intégralement le menu Streamlit, le bandeau d'outils et toute option de sélection de thème */
-    #MainMenu,
-    header,
-    header[data-testid="stHeader"],
-    [data-testid="stToolbar"],
-    [data-testid="stToolbarActionButton"],
-    [data-testid="stActionButton"],
-    [data-testid="stDecoration"],
-    [data-testid="stStatusWidget"],
-    footer[data-testid="stFooter"],
-    [data-testid="manage-app-button"] {
-        visibility: hidden !important;
-        display: none !important;
-        height: 0 !important;
-        width: 0 !important;
-        margin: 0 !important;
-        padding: 0 !important;
     }
 
     /* Conteneur principal de l'application */
     [data-testid="stAppViewContainer"],
     .main,
     .block-container {
-        background-color: #ffffff !important;
-        color: #0f172a !important;
+        background-color: #f8fafc !important;
+        color: #1e293b !important;
     }
 
     /* Volet latéral (Sidebar) */
@@ -127,9 +155,9 @@ st.markdown(
     [data-testid="stSidebar"] > div,
     [data-testid="stSidebarContent"],
     section[data-testid="stSidebar"] {
-        background-color: #f8fafc !important;
+        background-color: #ffffff !important;
         border-right: 1px solid #e2e8f0 !important;
-        color: #0f172a !important;
+        color: #1e293b !important;
     }
 
     /* Typographie générale : titres, paragraphes, spans, listes */
@@ -140,7 +168,7 @@ st.markdown(
     }
 
     p, span, div, li, td, th {
-        color: #0f172a;
+        color: #1e293b;
     }
 
     .stMarkdown,
@@ -149,7 +177,7 @@ st.markdown(
     [data-testid="stMarkdownContainer"] p,
     [data-testid="stMarkdownContainer"] li,
     [data-testid="stMarkdownContainer"] span {
-        color: #0f172a !important;
+        color: #1e293b !important;
     }
 
     /* Libellés de champs (Labels) bien sombres et lisibles */
@@ -157,7 +185,7 @@ st.markdown(
     [data-testid="stWidgetLabel"],
     [data-testid="stWidgetLabel"] p,
     [data-testid="stWidgetLabel"] span {
-        color: #1e293b !important;
+        color: #0f172a !important;
         font-weight: 600 !important;
         font-size: 0.88rem !important;
     }
@@ -289,7 +317,7 @@ st.markdown(
 
     /* Indicateurs Métriques (KPIs) */
     [data-testid="stMetric"] {
-        background-color: #f8fafc !important;
+        background-color: #ffffff !important;
         border: 1px solid #e2e8f0 !important;
         border-radius: 10px !important;
         padding: 0.85rem !important;
@@ -307,7 +335,7 @@ st.markdown(
 
     /* Salons de discussion privés (Chat Messages) */
     [data-testid="stChatMessage"] {
-        background-color: #f8fafc !important;
+        background-color: #ffffff !important;
         border: 1px solid #e2e8f0 !important;
         border-radius: 10px !important;
         color: #0f172a !important;
@@ -339,10 +367,78 @@ st.markdown(
     }
 
     /* ==========================================================================
-       2. STYLES DES COMPOSANTS ET CARTES MÉTIER PERSONNALISÉES (LIGHT STRICT)
+       3. CARTE D'EN-TÊTE BLEU NUIT / DÉGRADÉ SOMBRE (HERO BANNER)
+       Style préservé explicitement avec contraste blanc/or garanti
+       ========================================================================== */
+    .hero-banner {
+        background: linear-gradient(135deg, #1e3a8a 0%, #172554 100%) !important;
+        color: #ffffff !important;
+        padding: 2rem 2.2rem !important;
+        border-radius: 14px !important;
+        margin-bottom: 1.5rem !important;
+        box-shadow: 0 4px 14px rgba(15, 23, 42, 0.12) !important;
+    }
+
+    .hero-banner * {
+        color: #ffffff;
+    }
+
+    .hero-banner h1 {
+        color: #ffffff !important;
+        font-size: 2rem !important;
+        font-weight: 800 !important;
+        line-height: 1.2 !important;
+        margin: 0 0 0.5rem 0 !important;
+    }
+
+    .hero-banner p {
+        color: #e2e8f0 !important;
+        font-size: 1rem !important;
+        line-height: 1.6 !important;
+        margin: 0 0 1.25rem 0 !important;
+        max-width: 850px !important;
+    }
+
+    .hero-banner p strong {
+        color: #ffffff !important;
+    }
+
+    .hero-banner .hero-badge {
+        display: inline-block !important;
+        padding: 0.25rem 0.75rem !important;
+        background: rgba(59, 130, 246, 0.25) !important;
+        border: 1px solid rgba(147, 197, 253, 0.35) !important;
+        border-radius: 9999px !important;
+        font-size: 0.78rem !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.05em !important;
+        color: #bfdbfe !important;
+        margin-bottom: 0.75rem !important;
+    }
+
+    .hero-banner .hero-alpha-box {
+        background: rgba(255, 255, 255, 0.1) !important;
+        border: 1px solid rgba(255, 255, 255, 0.2) !important;
+        border-radius: 10px !important;
+        padding: 0.9rem 1.1rem !important;
+        font-size: 0.88rem !important;
+        color: #f8fafc !important;
+        line-height: 1.5 !important;
+    }
+
+    .hero-banner .hero-alpha-box strong {
+        color: #fde047 !important;
+    }
+
+    .hero-banner .hero-alpha-box em {
+        color: #ffffff !important;
+    }
+
+    /* ==========================================================================
+       4. STYLES DES COMPOSANTS ET CARTES MÉTIER PERSONNALISÉES (LIGHT)
        ========================================================================== */
     .permut-banner {
-        background-color: #f8fafc !important;
+        background-color: #ffffff !important;
         border: 1px solid #e2e8f0 !important;
         color: #0f172a !important;
         padding: 1.25rem 1.75rem !important;
@@ -1688,21 +1784,21 @@ tab0, tab1, tab2, tab3, tab4 = st.tabs(
 with tab0:
     st.markdown(
         """
-        <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; color: #0f172a; padding: 1.75rem 2rem; border-radius: 12px; margin-bottom: 1.5rem; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);">
-            <div style="display: inline-block; padding: 0.25rem 0.75rem; background-color: #dbeafe; border: 1px solid #bfdbfe; border-radius: 9999px; font-size: 0.78rem; font-weight: 700; letter-spacing: 0.05em; color: #1e40af; margin-bottom: 0.75rem;">
+        <div class="hero-banner" style="background: linear-gradient(135deg, #1E3A8A 0%, #172554 100%) !important; color: #FFFFFF !important; padding: 2rem 2.2rem; border-radius: 14px; margin-bottom: 1.5rem; box-shadow: 0 4px 14px rgba(15, 23, 42, 0.12);">
+            <div class="hero-badge" style="display: inline-block; padding: 0.25rem 0.75rem; background: rgba(59, 130, 246, 0.25); border: 1px solid rgba(147, 197, 253, 0.35); border-radius: 9999px; font-size: 0.78rem; font-weight: 700; letter-spacing: 0.05em; color: #BFDBFE !important; margin-bottom: 0.75rem;">
                 ✨ PROMOTION MÉDECINE 2028 · MASTER 2
             </div>
-            <h1 style="color: #0f172a; margin: 0 0 0.5rem 0; font-size: 1.85rem; font-weight: 800; line-height: 1.25;">
+            <h1 style="color: #FFFFFF !important; margin: 0 0 0.5rem 0; font-size: 2rem; font-weight: 800; line-height: 1.2;">
                 Trouvez votre binôme de stage idéal en quelques clics
             </h1>
-            <p style="color: #334155; margin: 0 0 1.25rem 0; font-size: 0.98rem; line-height: 1.6; max-width: 850px;">
-                Bienvenue sur <strong>PermutStage</strong>, la plateforme pensée pour fluidifier, simplifier et centraliser
+            <p style="color: #E2E8F0 !important; margin: 0 0 1.25rem 0; font-size: 1rem; line-height: 1.6; max-width: 850px;">
+                Bienvenue sur <strong style="color: #FFFFFF !important;">PermutStage</strong>, la plateforme pensée pour fluidifier, simplifier et centraliser
                 les échanges de lieux de stages hospitaliers entre camarades de promotion. Vos souhaits sont analysés
                 en temps réel par notre algorithme de permutation, dans le respect le plus strict de votre confidentialité.
             </p>
-            <div style="background-color: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 0.85rem 1.1rem; font-size: 0.88rem; color: #1e3a8a; line-height: 1.5;">
-                <strong style="color: #1e40af;">🤝 Statut du projet : Version Alpha / Concept Test</strong><br/>
-                Cette plateforme est une initiative bénévole conçue <em>par et pour les étudiants</em>. Merci pour votre
+            <div class="hero-alpha-box" style="background: rgba(255, 255, 255, 0.1) !important; border: 1px solid rgba(255, 255, 255, 0.2) !important; border-radius: 10px; padding: 0.9rem 1.1rem; font-size: 0.88rem; color: #F8FAFC !important; line-height: 1.5;">
+                <strong style="color: #FDE047 !important;">🤝 Statut du projet : Version Alpha / Concept Test</strong><br/>
+                Cette plateforme est une initiative bénévole conçue <em style="color: #FFFFFF !important;">par et pour les étudiants</em>. Merci pour votre
                 bienveillance et vos retours constructifs pour faire évoluer l'outil au service de toute la promotion !
             </div>
         </div>
