@@ -1,16 +1,21 @@
 """
 PermutStage — Plateforme Collaborative d'Échange de Lieux de Stage (Médecine P3 à P8)
-Architecture complète :
-- Comptes Étudiants (Feuille 'Utilisateurs' + st.session_state['user'])
+Architecture complète avec base de données Firebase Firestore (firebase-admin) :
+- Comptes Étudiants (Collection 'users' + st.session_state['user'] + st.query_params['auth'])
+- Offres de permutation (Collection 'demandes' avec écritures atomiques directes)
+- Messagerie instantanée privée (Collection 'messages' par salon sécurisé)
 - Confidentialité stricte des échanges (Matching Privé réservé aux étudiants impliqués)
 - Centre de Notifications dynamique en haut à droite + Onglet Alertes
 - Alertes Email automatiques via SMTP (smtplib + email.mime + st.secrets['smtp'])
-- Gestion complète des offres (Modification pré-remplie + Suppression avec confirmation)
-- Espace Administrateur (st.secrets['admin']['password'])
+- Gestion complète des offres (Modification pré-remplie + Suppression sécurisée)
+- Code PIN oublié (renvoi automatique par email) et modification de PIN
+- Accès Administrateur discret (st.secrets['admin']['password'])
+- Mode d'affichage clair strict verrouillé (aucun mode sombre)
 
 Exécution : streamlit run app.py
 """
 
+import os
 import re
 import uuid
 import smtplib
@@ -18,10 +23,11 @@ from email.mime.text import MIMEText
 from datetime import datetime
 import pandas as pd
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 # ---------------------------------------------------------------------------
-# 1. CONFIGURATION DE LA PAGE & STYLE ÉPURÉ (SANS LOGO)
+# 1. CONFIGURATION DE LA PAGE & STYLE ÉPURÉ (SANS LOGO, MODE CLAIR STRICT)
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="PermutStage — Permutation de Stages Médecine",
@@ -33,6 +39,44 @@ st.markdown(
     """
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700&display=swap');
+
+    /* Mode d'affichage clair strict (aucun mode sombre, interdiction de modifier le thème) */
+    :root {
+        color-scheme: light !important;
+    }
+
+    /* Masquer le menu Streamlit et la barre d'outils contenant le sélecteur de thème */
+    #MainMenu {
+        visibility: hidden !important;
+        display: none !important;
+    }
+    header [data-testid="stToolbar"] {
+        visibility: hidden !important;
+        display: none !important;
+    }
+    [data-testid="stToolbar"] {
+        visibility: hidden !important;
+        display: none !important;
+    }
+    [data-testid="stDecoration"] {
+        visibility: hidden !important;
+        display: none !important;
+    }
+    [data-testid="stStatusWidget"] {
+        visibility: hidden !important;
+        display: none !important;
+    }
+
+    /* Forcer l'arrière-plan clair et le texte sombre sur l'ensemble des conteneurs */
+    html, body, [data-testid="stAppViewContainer"], [data-testid="stSidebar"], .main {
+        background-color: #ffffff !important;
+        color: #0f172a !important;
+        color-scheme: light !important;
+    }
+    [data-testid="stSidebar"] {
+        background-color: #f8fafc !important;
+    }
+
     html, body, [class*="css"] {
         font-family: 'Plus Jakarta Sans', sans-serif;
     }
@@ -169,7 +213,12 @@ HOPITAL_VERS_REGION = {
     for hopital in liste_reg
 }
 
-# Colonnes exactes des 3 feuilles Google Sheets
+# Noms des 3 collections Firebase Firestore
+COLLECTION_USERS = "users"
+COLLECTION_DEMANDES = "demandes"
+COLLECTION_MESSAGES = "messages"
+
+# Schémas de colonnes normalisés
 COLONNES_UTILISATEURS = [
     "User_ID",
     "Nom",
@@ -180,6 +229,7 @@ COLONNES_UTILISATEURS = [
 ]
 
 COLONNES_DEMANDES = [
+    "Demande_ID",
     "Timestamp",
     "Nom",
     "Email",
@@ -199,15 +249,15 @@ COLONNES_MESSAGES = [
     "Texte",
 ]
 
-FEUILLE_UTILISATEURS = "Utilisateurs"
-FEUILLE_DEMANDES = "Demandes"
-FEUILLE_MESSAGES = "Messages"
-
-# Initialisation de la session utilisateur et de l'accès administrateur
+# ---------------------------------------------------------------------------
+# 3. INITIALISATION DE LA SESSION UTILISATEUR & GESTION ADMIN
+# ---------------------------------------------------------------------------
 if "user" not in st.session_state:
     st.session_state["user"] = None
 if "is_admin" not in st.session_state:
     st.session_state["is_admin"] = False
+if "notified_match_rooms" not in st.session_state:
+    st.session_state["notified_match_rooms"] = set()
 
 
 def check_admin_password(candidate_pwd: str) -> bool:
@@ -244,128 +294,282 @@ if hasattr(st, "dialog"):
 
 
 # ---------------------------------------------------------------------------
-# 3. PERSISTANCE GOOGLE SHEETS (3 FEUILLES : Utilisateurs, Demandes, Messages)
+# 4. INITIALISATION SÉCURISÉE & ACCÈS FIREBASE FIRESTORE (firebase-admin)
 # ---------------------------------------------------------------------------
-def get_connection():
-    return st.connection("gsheets", type=GSheetsConnection)
+@st.cache_resource
+def get_firestore_client():
+    """
+    Initialise l'application Firebase Admin de façon protégée (anti-réinitialisation multiple)
+    en utilisant les credentials stockés dans st.secrets['firebase'].
+    Retourne l'instance client Firestore.
+    """
+    if not firebase_admin._apps:
+        try:
+            if "firebase" not in st.secrets:
+                st.error(
+                    "Configuration Firebase introuvable. Veuillez définir [firebase] dans .streamlit/secrets.toml."
+                )
+                return None
+
+            fb_creds_dict = dict(st.secrets["firebase"])
+
+            # Gestion robuste du retour à la ligne dans la clé privée RSA
+            if "private_key" in fb_creds_dict and isinstance(fb_creds_dict["private_key"], str):
+                fb_creds_dict["private_key"] = fb_creds_dict["private_key"].replace("\\n", "\n")
+
+            cred = credentials.Certificate(fb_creds_dict)
+            firebase_admin.initialize_app(cred)
+        except Exception as exc:
+            st.error(f"Erreur d'initialisation du SDK Firebase Admin : {exc}")
+            return None
+
+    return firestore.client()
 
 
 def normalize_pin_series(series: pd.Series) -> pd.Series:
+    """Nettoie et force le format 4 chiffres pour une colonne de codes PIN."""
     s = (
         series.fillna("")
         .astype(str)
         .str.replace(r"\.0$", "", regex=True)
         .str.strip()
     )
-    return s.apply(lambda x: x.zfill(4) if x.isdigit() else x)
+    return s.apply(lambda x: x.zfill(4) if (x.isdigit() and len(x) <= 4) else x)
 
 
+@st.cache_data(ttl=15)
 def load_utilisateurs() -> pd.DataFrame:
-    """Lit la feuille 'Utilisateurs' depuis Google Sheets."""
+    """
+    Lit l'ensemble des documents de la collection 'users' dans Firestore.
+    Mise en cache partagée inter-sessions (ttl=15s) pour optimiser les performances.
+    """
+    db = get_firestore_client()
+    if db is None:
+        return pd.DataFrame(columns=COLONNES_UTILISATEURS)
+
     try:
-        conn = get_connection()
-        df = conn.read(worksheet=FEUILLE_UTILISATEURS, ttl=5)
-        if df is None or df.empty:
+        docs = db.collection(COLLECTION_USERS).stream()
+        data = []
+        for doc in docs:
+            item = doc.to_dict() or {}
+            item["User_ID"] = str(item.get("User_ID") or doc.id).strip()
+            data.append(item)
+
+        if not data:
             return pd.DataFrame(columns=COLONNES_UTILISATEURS)
-        df = df.dropna(how="all")
+
+        df = pd.DataFrame(data)
         for col in COLONNES_UTILISATEURS:
             if col not in df.columns:
                 df[col] = ""
+
         df["PIN"] = normalize_pin_series(df["PIN"])
         for col in ["User_ID", "Nom", "Prenom", "Email", "Date_Inscription"]:
             df[col] = df[col].fillna("").astype(str).str.strip()
+
         return df[COLONNES_UTILISATEURS]
     except Exception as exc:
-        st.error(f"Erreur lors de la lecture de la feuille '{FEUILLE_UTILISATEURS}' : {exc}")
+        st.error(f"Erreur lors de la lecture de la collection '{COLLECTION_USERS}' : {exc}")
         return pd.DataFrame(columns=COLONNES_UTILISATEURS)
 
 
-def save_utilisateurs(df: pd.DataFrame) -> bool:
-    """Met à jour la feuille 'Utilisateurs' dans Google Sheets."""
+def create_user_firestore(user_dict: dict) -> bool:
+    """
+    Crée un document utilisateur directement dans la collection 'users' de Firestore
+    sans risque de collision, puis purge le cache de lecture.
+    """
+    db = get_firestore_client()
+    if db is None:
+        return False
+
     try:
-        conn = get_connection()
-        conn.update(worksheet=FEUILLE_UTILISATEURS, data=df[COLONNES_UTILISATEURS])
+        user_id = user_dict["User_ID"]
+        db.collection(COLLECTION_USERS).document(user_id).set(user_dict)
         st.cache_data.clear()
         return True
     except Exception as exc:
-        st.error(f"Erreur lors de l'écriture dans la feuille '{FEUILLE_UTILISATEURS}' : {exc}")
+        st.error(f"Erreur lors de la création du compte dans Firestore : {exc}")
         return False
 
 
-def load_demandes() -> pd.DataFrame:
-    """Lit la feuille 'Demandes' depuis Google Sheets."""
+def update_user_pin_firestore(user_id: str, email: str, new_pin: str) -> bool:
+    """
+    Met à jour atomiquement le code PIN d'un utilisateur dans 'users'
+    et synchronise ses offres actives dans 'demandes', puis purge le cache.
+    """
+    db = get_firestore_client()
+    if db is None:
+        return False
+
     try:
-        conn = get_connection()
-        df = conn.read(worksheet=FEUILLE_DEMANDES, ttl=5)
-        if df is None or df.empty:
+        pin_clean = str(new_pin).strip().zfill(4)
+        db.collection(COLLECTION_USERS).document(user_id).update({"PIN": pin_clean})
+
+        # Mettre à jour en cascade le PIN dans les annonces publiées par cet email
+        clean_email = email.strip().lower()
+        demandes_query = db.collection(COLLECTION_DEMANDES).where("Email", "==", clean_email).stream()
+        for doc in demandes_query:
+            doc.reference.update({"PIN": pin_clean})
+
+        st.cache_data.clear()
+        return True
+    except Exception as exc:
+        st.error(f"Erreur lors de la mise à jour du code PIN : {exc}")
+        return False
+
+
+@st.cache_data(ttl=15)
+def load_demandes() -> pd.DataFrame:
+    """
+    Lit l'ensemble des offres de la collection 'demandes' dans Firestore.
+    Mise en cache partagée inter-sessions (ttl=15s).
+    """
+    db = get_firestore_client()
+    if db is None:
+        return pd.DataFrame(columns=COLONNES_DEMANDES)
+
+    try:
+        docs = db.collection(COLLECTION_DEMANDES).stream()
+        data = []
+        for doc in docs:
+            item = doc.to_dict() or {}
+            item["Demande_ID"] = str(item.get("Demande_ID") or doc.id).strip()
+            data.append(item)
+
+        if not data:
             return pd.DataFrame(columns=COLONNES_DEMANDES)
-        df = df.dropna(how="all")
+
+        df = pd.DataFrame(data)
         for col in COLONNES_DEMANDES:
             if col not in df.columns:
                 df[col] = ""
+
         df["PIN"] = normalize_pin_series(df["PIN"])
-        for col in ["Timestamp", "Nom", "Email", "Periode", "Specialite", "Hopital_Actuel", "Hopitaux_Souhaites"]:
+        for col in ["Demande_ID", "Timestamp", "Nom", "Email", "Periode", "Specialite", "Hopital_Actuel", "Hopitaux_Souhaites"]:
             df[col] = df[col].fillna("").astype(str).str.strip()
+
         return df[COLONNES_DEMANDES]
     except Exception as exc:
-        st.error(f"Erreur lors de la lecture de la feuille '{FEUILLE_DEMANDES}' : {exc}")
+        st.error(f"Erreur lors de la lecture de la collection '{COLLECTION_DEMANDES}' : {exc}")
         return pd.DataFrame(columns=COLONNES_DEMANDES)
 
 
-def save_demandes(df: pd.DataFrame) -> bool:
-    """Met à jour la feuille 'Demandes' dans Google Sheets."""
+def add_demande_firestore(demande_dict: dict) -> bool:
+    """
+    Publie une nouvelle demande dans 'demandes' avec écriture directe Firestore
+    et actualisation immédiate du cache.
+    """
+    db = get_firestore_client()
+    if db is None:
+        return False
+
     try:
-        conn = get_connection()
-        conn.update(worksheet=FEUILLE_DEMANDES, data=df[COLONNES_DEMANDES])
+        demande_id = demande_dict.get("Demande_ID") or f"DEM_{uuid.uuid4().hex[:10].upper()}"
+        demande_dict["Demande_ID"] = demande_id
+        db.collection(COLLECTION_DEMANDES).document(demande_id).set(demande_dict)
         st.cache_data.clear()
         return True
     except Exception as exc:
-        st.error(f"Erreur lors de l'écriture dans la feuille '{FEUILLE_DEMANDES}' : {exc}")
+        st.error(f"Erreur lors du dépôt de la demande dans Firestore : {exc}")
         return False
 
 
-def load_messages() -> pd.DataFrame:
-    """Lit la feuille 'Messages' depuis Google Sheets."""
+def update_demande_firestore(demande_id: str, fields: dict) -> bool:
+    """
+    Modifie une demande existante dans 'demandes' via son identifiant de document Firestore.
+    """
+    db = get_firestore_client()
+    if db is None:
+        return False
+
     try:
-        conn = get_connection()
-        df = conn.read(worksheet=FEUILLE_MESSAGES, ttl=5)
-        if df is None or df.empty:
+        db.collection(COLLECTION_DEMANDES).document(demande_id).update(fields)
+        st.cache_data.clear()
+        return True
+    except Exception as exc:
+        st.error(f"Erreur lors de la modification de l'offre dans Firestore : {exc}")
+        return False
+
+
+def delete_demande_firestore(demande_id: str) -> bool:
+    """
+    Supprime définitivement un document de la collection 'demandes'.
+    """
+    db = get_firestore_client()
+    if db is None:
+        return False
+
+    try:
+        db.collection(COLLECTION_DEMANDES).document(demande_id).delete()
+        st.cache_data.clear()
+        return True
+    except Exception as exc:
+        st.error(f"Erreur lors de la suppression de l'offre dans Firestore : {exc}")
+        return False
+
+
+@st.cache_data(ttl=15)
+def load_messages() -> pd.DataFrame:
+    """
+    Lit l'ensemble des messages de la collection 'messages' dans Firestore
+    avec cache inter-sessions (ttl=15s).
+    """
+    db = get_firestore_client()
+    if db is None:
+        return pd.DataFrame(columns=COLONNES_MESSAGES)
+
+    try:
+        docs = db.collection(COLLECTION_MESSAGES).stream()
+        data = []
+        for doc in docs:
+            item = doc.to_dict() or {}
+            item["Message_ID"] = str(item.get("Message_ID") or doc.id).strip()
+            data.append(item)
+
+        if not data:
             return pd.DataFrame(columns=COLONNES_MESSAGES)
-        df = df.dropna(how="all")
+
+        df = pd.DataFrame(data)
         for col in COLONNES_MESSAGES:
             if col not in df.columns:
                 df[col] = ""
             df[col] = df[col].fillna("").astype(str).str.strip()
+
+        # Tri chronologique des messages
+        if not df.empty and "Timestamp" in df.columns:
+            df = df.sort_values(by="Timestamp", ascending=True).reset_index(drop=True)
+
         return df[COLONNES_MESSAGES]
     except Exception as exc:
-        st.error(f"Erreur lors de la lecture de la feuille '{FEUILLE_MESSAGES}' : {exc}")
+        st.error(f"Erreur lors de la lecture de la collection '{COLLECTION_MESSAGES}' : {exc}")
         return pd.DataFrame(columns=COLONNES_MESSAGES)
 
 
-def append_message(
-    df_messages: pd.DataFrame,
+def append_message_firestore(
     room_id: str,
     sender_email: str,
     sender_name: str,
     texte: str,
 ) -> bool:
-    """Ajoute un message dans la feuille 'Messages' et vide le cache."""
-    nouveau_msg = pd.DataFrame(
-        [
-            {
-                "Message_ID": f"MSG_{uuid.uuid4().hex[:10].upper()}",
-                "Room_ID": room_id,
-                "Sender_Email": sender_email.strip().lower(),
-                "Sender_Name": sender_name.strip(),
-                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "Texte": texte.strip(),
-            }
-        ]
-    )
-    df_maj = pd.concat([df_messages, nouveau_msg], ignore_index=True)
+    """
+    Écrit un nouveau message directement dans la collection 'messages' de Firestore
+    sans bloquer les autres salons, puis purge le cache.
+    """
+    db = get_firestore_client()
+    if db is None:
+        return False
+
     try:
-        conn = get_connection()
-        conn.update(worksheet=FEUILLE_MESSAGES, data=df_maj[COLONNES_MESSAGES])
+        msg_id = f"MSG_{uuid.uuid4().hex[:10].upper()}"
+        nouveau_msg = {
+            "Message_ID": msg_id,
+            "Room_ID": room_id.strip(),
+            "Sender_Email": sender_email.strip().lower(),
+            "Sender_Name": sender_name.strip(),
+            "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Texte": texte.strip(),
+        }
+        db.collection(COLLECTION_MESSAGES).document(msg_id).set(nouveau_msg)
         st.cache_data.clear()
         return True
     except Exception as exc:
@@ -388,18 +592,13 @@ def build_room_id(periode: str, specialite: str, emails: list[str]) -> str:
     return f"ROOM_{periode}_{specialite}_{'_'.join(sorted_emails)}"
 
 
-# Initialisation du registre anti-doublon d'envoi d'emails en session
-if "notified_match_rooms" not in st.session_state:
-    st.session_state["notified_match_rooms"] = set()
-
-
 # ---------------------------------------------------------------------------
-# 4. SYSTÈME D'ALERTES PAR EMAIL (OPTION A : UNIQUEMENT EN CAS DE MATCH DIRECT)
+# 5. SYSTÈME D'ALERTES PAR EMAIL (OPTION A : DÉCLENCHÉ SUR MATCH DIRECT)
 # ---------------------------------------------------------------------------
 def resolve_student_prenom(
     email: str, fallback_nom: str, df_utilisateurs: pd.DataFrame
 ) -> str:
-    """Récupère le prénom de l'étudiant depuis la feuille 'Utilisateurs' ou depuis son nom complet."""
+    """Récupère le prénom de l'étudiant depuis le profil 'users' ou depuis son nom complet."""
     clean_email = (email or "").strip().lower()
     if df_utilisateurs is not None and not df_utilisateurs.empty and clean_email:
         rows = df_utilisateurs[
@@ -436,7 +635,7 @@ def send_match_notification_emails(
         smtp_user = str(smtp_cfg["username"]).strip()
         smtp_password = str(smtp_cfg["password"])
     except Exception:
-        # Si les secrets SMTP ne sont pas configurés, l'enregistrement Google Sheets reste prioritaire
+        # Si les secrets SMTP ne sont pas configurés, l'enregistrement Firestore reste prioritaire
         return 0
 
     sujet = "[PermutStage] Un échange de stage est disponible pour vous !"
@@ -476,14 +675,12 @@ def send_match_notification_emails(
                     msg["To"] = dest_email
                     server.send_message(msg)
                     sent_count += 1
-                except Exception as e:
-                    # Anti-plantage individuel si une adresse email destinataire est invalide
+                except Exception:
                     continue
 
         st.session_state["notified_match_rooms"].add(room_id)
         return sent_count
-    except Exception as e:
-        # Anti-plantage absolu : aucun écran rouge si le serveur SMTP a un ralentissement
+    except Exception:
         return sent_count
 
 
@@ -494,7 +691,7 @@ def trigger_new_match_emails(
     df_messages: pd.DataFrame,
 ) -> None:
     """
-    Vérifie automatiquement après un ajout ou une modification dans 'Demandes' si un nouveau
+    Vérifie automatiquement après un ajout ou une modification dans 'demandes' si un nouveau
     cycle complet (bilatéral A<->B ou triangulaire A->B->C->A) vient de se former.
     N'envoie jamais d'email pour une offre isolée ou un match déjà existant.
     """
@@ -529,15 +726,14 @@ def trigger_new_match_emails(
                     room_id=t["room_id"],
                     df_utilisateurs=df_utilisateurs,
                 )
-    except Exception as e:
-        # Priorité absolue à la persistance Google Sheets
+    except Exception:
         pass
 
 
 def send_pin_recovery_email(dest_email: str, prenom: str, pin: str) -> bool:
     """
     Envoie le code PIN par email via SMTP en cas d'oubli de l'étudiant.
-    Respecte l'objet et le corps de message demandés.
+    Respecte l'objet et le corps de message personnalisés.
     """
     try:
         smtp_cfg = st.secrets["smtp"]
@@ -576,11 +772,13 @@ def send_pin_recovery_email(dest_email: str, prenom: str, pin: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 5. MOTEUR DE MATCHING & FILTRE DE CONFIDENTIALITÉ STRICTE
+# 6. MOTEUR DE MATCHING & FILTRE DE CONFIDENTIALITÉ STRICTE
 # ---------------------------------------------------------------------------
 def compute_bilateral_matches(df: pd.DataFrame) -> list[dict]:
     """Détecte tous les échanges bilatéraux (A <-> B) pour même période et même spécialité."""
     matches = []
+    if df.empty:
+        return matches
     records = df.to_dict("records")
     n = len(records)
 
@@ -622,6 +820,8 @@ def compute_bilateral_matches(df: pd.DataFrame) -> list[dict]:
 def compute_triangular_matches(df: pd.DataFrame) -> list[dict]:
     """Détecte tous les cycles à 3 personnes (A donne à B, B donne à C, C donne à A)."""
     matches = []
+    if df.empty:
+        return matches
     seen_cycles = set()
     records = df.to_dict("records")
     n = len(records)
@@ -765,7 +965,7 @@ def build_user_notifications(
 
 
 # ---------------------------------------------------------------------------
-# 6. COMPOSANT DE SALON DE CHAT PRIVÉ (RÉSERVÉ AUX MEMBRES CONNECTÉS DU MATCH)
+# 7. COMPOSANT DE SALON DE CHAT PRIVÉ (RÉSERVÉ AUX PARTICIPANTS DU MATCH)
 # ---------------------------------------------------------------------------
 def render_private_chat_room(
     room_id: str,
@@ -773,8 +973,8 @@ def render_private_chat_room(
     df_messages: pd.DataFrame,
     label_expander: str,
 ):
-    """Salon de discussion privé : l'étudiant est déjà authentifié via st.session_state['user']."""
-    messages_salon = df_messages[df_messages["Room_ID"] == room_id]
+    """Salon de discussion privé avec persistance Firestore par document unique."""
+    messages_salon = df_messages[df_messages["Room_ID"] == room_id] if not df_messages.empty else pd.DataFrame()
     nb_msg = len(messages_salon)
     user_email = current_user["Email"].strip().lower()
     user_full_name = f"{current_user['Prenom']} {current_user['Nom']}".strip()
@@ -796,18 +996,76 @@ def render_private_chat_room(
             key=f"chat_input_{room_id}",
         )
         if nouveau_texte and nouveau_texte.strip():
-            if append_message(
-                df_messages, room_id, user_email, user_full_name, nouveau_texte
+            if append_message_firestore(
+                room_id, user_email, user_full_name, nouveau_texte
             ):
                 st.rerun()
 
 
 # ---------------------------------------------------------------------------
-# 7. CHARGEMENT DES DONNÉES & BARRE LATÉRALE (PROFIL ÉTUDIANT + ADMIN)
+# 8. CHARGEMENT DES DONNÉES & PERSISTANCE DE SESSION VIA ST.QUERY_PARAMS
 # ---------------------------------------------------------------------------
+def get_auth_query_param() -> str | None:
+    """Récupère l'identifiant de session stocké dans l'URL (st.query_params)."""
+    try:
+        if hasattr(st, "query_params"):
+            val = st.query_params.get("auth", None)
+            return str(val).strip() if val else None
+        elif hasattr(st, "experimental_get_query_params"):
+            params = st.experimental_get_query_params()
+            if "auth" in params and params["auth"]:
+                return str(params["auth"][0]).strip()
+    except Exception:
+        pass
+    return None
+
+
+def set_auth_query_param(token: str):
+    """Enregistre le jeton de session dans l'URL (st.query_params['auth'] = user_id)."""
+    try:
+        if hasattr(st, "query_params"):
+            st.query_params["auth"] = token
+        elif hasattr(st, "experimental_set_query_params"):
+            st.experimental_set_query_params(auth=token)
+    except Exception:
+        pass
+
+
+def clear_query_params():
+    """Efface complètement les paramètres d'URL lors de la déconnexion."""
+    try:
+        if hasattr(st, "query_params"):
+            st.query_params.clear()
+        elif hasattr(st, "experimental_set_query_params"):
+            st.experimental_set_query_params()
+    except Exception:
+        pass
+
+
 df_utilisateurs = load_utilisateurs()
 df_demandes = load_demandes()
 df_messages = load_messages()
+
+# Reconnexion automatique et transparente si 'auth' est présent dans l'URL (F5 / réveil smartphone)
+auth_token = get_auth_query_param()
+if auth_token and st.session_state.get("user") is None and not df_utilisateurs.empty:
+    target_clean = auth_token.strip()
+    match_users = df_utilisateurs[
+        (df_utilisateurs["User_ID"].astype(str).str.strip().str.lower() == target_clean.lower())
+        | (df_utilisateurs["Email"].astype(str).str.strip().str.lower() == target_clean.lower())
+    ]
+    if not match_users.empty:
+        u_saved = match_users.iloc[0]
+        st.session_state["user"] = {
+            "User_ID": str(u_saved["User_ID"]).strip(),
+            "Nom": str(u_saved["Nom"]).strip(),
+            "Prenom": str(u_saved["Prenom"]).strip(),
+            "Email": str(u_saved["Email"]).strip().lower(),
+            "PIN": str(u_saved["PIN"]).strip(),
+        }
+        set_auth_query_param(str(u_saved["User_ID"]).strip())
+    else:
+        clear_query_params()
 
 all_matchs_binomes = compute_bilateral_matches(df_demandes)
 all_matchs_triangulaires = compute_triangular_matches(df_demandes)
@@ -822,6 +1080,9 @@ mes_notifications = build_user_notifications(
     current_user_email, mes_matchs_binomes, mes_matchs_triangulaires, df_messages
 )
 
+# ---------------------------------------------------------------------------
+# 9. VOLET LATÉRAL (PROFIL, CONNEXION, MODIFICATION PIN, DÉCONNEXION)
+# ---------------------------------------------------------------------------
 with st.sidebar:
     st.subheader("Mon Compte Étudiant")
     if current_user is not None:
@@ -857,21 +1118,17 @@ with st.sidebar:
                     elif n_clean != c_clean:
                         st.error("La confirmation ne correspond pas au nouveau code PIN.")
                     else:
-                        mask_u = df_utilisateurs["Email"].str.lower() == current_user_email
-                        if mask_u.any():
-                            df_utilisateurs.loc[mask_u, "PIN"] = n_clean
-                            if save_utilisateurs(df_utilisateurs):
-                                if not df_demandes.empty:
-                                    mask_d = df_demandes["Email"].str.lower() == current_user_email
-                                    if mask_d.any():
-                                        df_demandes.loc[mask_d, "PIN"] = n_clean
-                                        save_demandes(df_demandes)
-                                st.session_state["user"]["PIN"] = n_clean
-                                st.success("Votre code PIN a été modifié avec succès !")
-                                st.rerun()
+                        if update_user_pin_firestore(
+                            current_user["User_ID"], current_user_email, n_clean
+                        ):
+                            st.session_state["user"]["PIN"] = n_clean
+                            st.success("Votre code PIN a été modifié avec succès dans Firestore !")
+                            st.rerun()
 
         if st.button("Se déconnecter", use_container_width=True):
+            clear_query_params()
             st.session_state["user"] = None
+            st.session_state["is_admin"] = False
             st.rerun()
     else:
         auth_tabs = st.tabs(["Connexion", "Créer un compte"])
@@ -901,16 +1158,18 @@ with st.sidebar:
                         st.error("Code PIN incorrect.")
                     else:
                         u_row = user_rows.iloc[0]
-                        st.session_state["user"] = {
-                            "User_ID": u_row["User_ID"],
-                            "Nom": u_row["Nom"],
-                            "Prenom": u_row["Prenom"],
-                            "Email": u_row["Email"].strip().lower(),
+                        user_session = {
+                            "User_ID": str(u_row["User_ID"]).strip(),
+                            "Nom": str(u_row["Nom"]).strip(),
+                            "Prenom": str(u_row["Prenom"]).strip(),
+                            "Email": str(u_row["Email"]).strip().lower(),
                             "PIN": str(u_row["PIN"]).strip(),
                         }
+                        st.session_state["user"] = user_session
+                        set_auth_query_param(str(user_session["User_ID"]).strip())
                         st.rerun()
 
-            # Option Code PIN oublié (Renvoi par email)
+            # Option Code PIN oublié (Renvoi par email SMTP)
             with st.expander("🔑 Code PIN oublié ?", expanded=False):
                 st.caption("Recevez immédiatement votre code PIN sur votre adresse email institutionnelle.")
                 with st.form("sidebar_forgot_pin_form"):
@@ -998,13 +1257,10 @@ with st.sidebar:
                                 "%Y-%m-%d %H:%M:%S"
                             ),
                         }
-                        df_u_maj = pd.concat(
-                            [df_utilisateurs, pd.DataFrame([new_user_dict])],
-                            ignore_index=True,
-                        )
-                        if save_utilisateurs(df_u_maj):
+                        if create_user_firestore(new_user_dict):
                             st.session_state["user"] = new_user_dict
-                            st.success("Compte créé et connecté !")
+                            set_auth_query_param(str(new_user_dict["User_ID"]).strip())
+                            st.success("Compte créé avec succès dans Firestore !")
                             st.rerun()
 
     st.divider()
@@ -1018,7 +1274,7 @@ with st.sidebar:
     )
 
 # ---------------------------------------------------------------------------
-# 8. EN-TÊTE PRINCIPAL & CENTRE DE NOTIFICATIONS (EN HAUT À DROITE)
+# 10. EN-TÊTE PRINCIPAL & CENTRE DE NOTIFICATIONS (EN HAUT À DROITE)
 # ---------------------------------------------------------------------------
 header_col_left, header_col_right = st.columns([3, 1])
 
@@ -1030,7 +1286,7 @@ with header_col_left:
                 PermutStage — Permutation de Stages de Médecine (P3 à P8)
             </h1>
             <p style="margin: 0.35rem 0 0 0; font-size: 0.92rem; color: #475569;">
-                Confidentialité stricte : vos correspondances et salons de discussion sont privés et visibles uniquement par les participants concernés.
+                Base de données haute performance Firebase Firestore · Confidentialité stricte des échanges et messagerie privée.
             </p>
         </div>
         """,
@@ -1066,7 +1322,7 @@ if st.session_state.get("is_admin", False):
         col_adm_head, col_adm_logout = st.columns([4, 1])
         with col_adm_head:
             st.markdown("### 🛠️ Espace Administrateur Débloqué")
-            st.caption("Supervision complète des offres, gestion des tables Google Sheets et statistiques de promotion.")
+            st.caption("Supervision complète des offres, gestion des collections Firestore et statistiques de promotion.")
         with col_adm_logout:
             if st.button("🔒 Verrouiller l'accès", use_container_width=True, help="Quitter le mode administrateur"):
                 st.session_state["is_admin"] = False
@@ -1085,7 +1341,7 @@ if st.session_state.get("is_admin", False):
             st.metric("Boucles triangulaires", len(all_matchs_triangulaires))
 
         # 2. Vue globale sur l'ensemble des demandes & Export CSV
-        st.markdown("#### 📋 Vue globale sur l'ensemble des demandes (`Demandes`)")
+        st.markdown("#### 📋 Vue globale sur la collection `demandes`")
         csv_bytes = df_demandes.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="📥 Télécharger l'état complet des demandes (.CSV)",
@@ -1095,27 +1351,26 @@ if st.session_state.get("is_admin", False):
         )
         st.dataframe(df_demandes, use_container_width=True, hide_index=True)
 
-        # 3. Gestion des tables
-        st.markdown("#### ⚙️ Gestion des tables & Suppression administrative")
-        adm_t1, adm_t2, adm_t3 = st.tabs(["Supprimer une demande", "Table Utilisateurs", "Table Messages"])
+        # 3. Gestion des collections
+        st.markdown("#### ⚙️ Gestion des collections Firestore & Suppression administrative")
+        adm_t1, adm_t2, adm_t3 = st.tabs(["Supprimer une demande", "Collection users", "Collection messages"])
         with adm_t1:
             if not df_demandes.empty:
-                st.caption("Suppression administrative directe d'une offre (sans code PIN).")
+                st.caption("Suppression administrative directe d'un document Firestore (sans code PIN).")
                 options_suppression = [
-                    f"{idx} | {row['Periode']} - {row['Specialite']} | {row['Nom']} ({row['Email']}) — {row['Hopital_Actuel']}"
-                    for idx, row in df_demandes.iterrows()
+                    f"{row['Demande_ID']} | {row['Periode']} - {row['Specialite']} | {row['Nom']} ({row['Email']}) — {row['Hopital_Actuel']}"
+                    for _, row in df_demandes.iterrows()
                 ]
                 choix_admin_del = st.selectbox(
                     "Sélectionner l'annonce à supprimer", options=options_suppression, key="admin_del_select_box"
                 )
                 if st.button("Supprimer définitivement cette offre (Admin)", type="primary", key="btn_admin_del_submit"):
-                    idx_to_drop = int(choix_admin_del.split(" | ")[0])
-                    df_restant = df_demandes.drop(index=idx_to_drop).reset_index(drop=True)
-                    if save_demandes(df_restant):
-                        st.success("Annonce supprimée avec succès par l'administrateur.")
+                    id_to_drop = choix_admin_del.split(" | ")[0].strip()
+                    if delete_demande_firestore(id_to_drop):
+                        st.success(f"Annonce {id_to_drop} supprimée avec succès de Firestore.")
                         st.rerun()
             else:
-                st.info("Aucune annonce active dans la table des demandes.")
+                st.info("Aucune annonce active dans la collection des demandes.")
 
         with adm_t2:
             st.dataframe(df_utilisateurs, use_container_width=True, hide_index=True)
@@ -1124,7 +1379,7 @@ if st.session_state.get("is_admin", False):
             st.dataframe(df_messages, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------------------------
-# 9. ONGLETS PRINCIPAUX DE L'APPLICATION
+# 11. ONGLETS PRINCIPAUX DE L'APPLICATION
 # ---------------------------------------------------------------------------
 nb_mes_matchs = len(mes_matchs_binomes) + len(mes_matchs_triangulaires)
 
@@ -1166,7 +1421,7 @@ with tab0:
         unsafe_allow_html=True,
     )
 
-    # 2. Fonctionnement pas-à-pas
+    # Fonctionnement pas-à-pas
     st.subheader("🧭 Comment ça marche ? (Le parcours en 4 étapes simples)")
     col_e1, col_e2, col_e3, col_e4 = st.columns(4)
 
@@ -1230,7 +1485,6 @@ with tab0:
     st.write("")
     col_regles, col_rgpd = st.columns(2)
 
-    # 3. Règles & Conditions d'Échange
     with col_regles:
         st.subheader("⚖️ Les Règles & Conditions d'Échange")
         st.markdown(
@@ -1241,12 +1495,11 @@ with tab0:
             """
         )
 
-    # 4. Confidentialité & Protection des Données Personnelles
     with col_rgpd:
         st.subheader("🔒 Confidentialité & Respect de la Vie Privée")
         st.markdown(
             """
-            * **Authentification minimale par code PIN :** Pas de stockage de mots de passe sensibles. Vos coordonnées sont protégées par votre email institutionnel et un PIN personnel à 4 chiffres.
+            * **Authentification minimale par code PIN :** Pas de stockage de mots de passe complexes. Vos coordonnées sont protégées par votre email institutionnel et un PIN personnel à 4 chiffres.
             * **Minimisation stricte des données :** Seules les informations strictement indispensables à la logistique de permutation sont traitées.
             * **Matching 100 % privé et hermétique :** Les autres camarades de promotion ne voient **jamais** qui permute avec qui. Seuls les étudiants directement concernés par un cycle complet ont accès aux coordonnées et aux salons de discussion.
             """
@@ -1255,7 +1508,6 @@ with tab0:
     st.write("")
     st.divider()
 
-    # 5. Appel à l'action (Call-to-Action)
     st.markdown("### 🚀 Prêt(e) à trouver votre permutation ?")
     c_btn1, c_btn2, _ = st.columns([1.5, 1.5, 3])
     with c_btn1:
@@ -1365,32 +1617,27 @@ with tab1:
                     for err in erreurs:
                         st.error(err)
                 else:
-                    # Mémoriser les Room_IDs existants avant ajout pour détecter les NOUVEAUX matchs
                     anciens_rooms = {
                         m["room_id"] for m in all_matchs_binomes
                     } | {t["room_id"] for t in all_matchs_triangulaires}
 
-                    nouvelle_demande = pd.DataFrame(
-                        [
-                            {
-                                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "Nom": nom_complet_verrouille,
-                                "Email": email_verrouille,
-                                "PIN": str(current_user.get("PIN", "")).strip(),
-                                "Periode": periode,
-                                "Specialite": specialite,
-                                "Hopital_Actuel": hopital_actuel,
-                                "Hopitaux_Souhaites": serialize_hospitals(
-                                    hopitaux_souhaites
-                                ),
-                            }
-                        ]
-                    )
-                    df_maj = pd.concat(
-                        [df_demandes, nouvelle_demande], ignore_index=True
-                    )
-                    if save_demandes(df_maj):
-                        # Vérifier uniquement les nouveaux cycles complets (bilatéraux ou triangulaires)
+                    nouvelle_demande_dict = {
+                        "Demande_ID": f"DEM_{uuid.uuid4().hex[:10].upper()}",
+                        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Nom": nom_complet_verrouille,
+                        "Email": email_verrouille,
+                        "PIN": str(current_user.get("PIN", "")).strip(),
+                        "Periode": periode,
+                        "Specialite": specialite,
+                        "Hopital_Actuel": hopital_actuel,
+                        "Hopitaux_Souhaites": serialize_hospitals(hopitaux_souhaites),
+                    }
+
+                    if add_demande_firestore(nouvelle_demande_dict):
+                        df_maj = pd.concat(
+                            [df_demandes, pd.DataFrame([nouvelle_demande_dict])],
+                            ignore_index=True,
+                        )
                         trigger_new_match_emails(
                             anciens_rooms=anciens_rooms,
                             df_demandes_maj=df_maj,
@@ -1399,7 +1646,7 @@ with tab1:
                         )
 
                         st.success(
-                            f"Votre demande pour la période {periode} ({specialite}) a été publiée !"
+                            f"Votre demande pour la période {periode} ({specialite}) a été publiée avec succès !"
                         )
                         st.rerun()
 
@@ -1570,7 +1817,7 @@ with tab3:
             )
 
 # ===========================================================================
-# ONGLET 4 : GÉRER MON OFFRE (MODIFICATION PRÉ-REMPLIE & SUPPRESSION CONFIRMÉE)
+# ONGLET 4 : GÉRER MON OFFRE (MODIFICATION PRÉ-REMPLIE & SUPPRESSION SÉCURISÉE)
 # ===========================================================================
 with tab4:
     st.subheader("Gérer mes annonces publiées (Modification & Suppression)")
@@ -1589,6 +1836,7 @@ with tab4:
             )
         else:
             for idx, row in df_mes_offres.iterrows():
+                demande_id_courante = str(row["Demande_ID"]).strip()
                 periode_courante = row["Periode"]
                 spec_courante = row["Specialite"]
                 hop_actuel_courant = row["Hopital_Actuel"]
@@ -1599,7 +1847,7 @@ with tab4:
                 ]
 
                 with st.expander(
-                    f"📌 Période {periode_courante} · {spec_courante} — Actuel : {hop_actuel_courant} (Modifié le {row['Timestamp']})",
+                    f"📌 Période {periode_courante} · {spec_courante} — Actuel : {hop_actuel_courant} (ID: {demande_id_courante})",
                     expanded=True,
                 ):
                     col_edit, col_del = st.columns([2, 1])
@@ -1607,14 +1855,14 @@ with tab4:
                     # OPTION 1 : MODIFIER L'ANNONCE
                     with col_edit:
                         st.markdown("##### Option 1 : Modifier l'annonce")
-                        with st.form(f"edit_form_{idx}"):
+                        with st.form(f"edit_form_{demande_id_courante}"):
                             new_periode = st.selectbox(
                                 "Période",
                                 options=PERIODES,
                                 index=PERIODES.index(periode_courante)
                                 if periode_courante in PERIODES
                                 else 0,
-                                key=f"edit_per_{idx}",
+                                key=f"edit_per_{demande_id_courante}",
                             )
                             new_spec = st.selectbox(
                                 "Spécialité",
@@ -1622,7 +1870,7 @@ with tab4:
                                 index=SPECIALITES.index(spec_courante)
                                 if spec_courante in SPECIALITES
                                 else 0,
-                                key=f"edit_spec_{idx}",
+                                key=f"edit_spec_{demande_id_courante}",
                             )
                             new_hop_actuel = st.selectbox(
                                 "Hôpital actuel",
@@ -1630,14 +1878,14 @@ with tab4:
                                 index=TOUS_LES_HOPITAUX.index(hop_actuel_courant)
                                 if hop_actuel_courant in TOUS_LES_HOPITAUX
                                 else 0,
-                                key=f"edit_act_{idx}",
+                                key=f"edit_act_{demande_id_courante}",
                             )
                             new_souhaites = st.multiselect(
                                 "Hôpitaux souhaités",
                                 options=TOUS_LES_HOPITAUX,
                                 default=souhaites_courants,
                                 format_func=lambda h: f"[{HOPITAL_VERS_REGION.get(h, '')}] {h}",
-                                key=f"edit_wish_{idx}",
+                                key=f"edit_wish_{demande_id_courante}",
                             )
                             btn_save_edit = st.form_submit_button(
                                 "Enregistrer les modifications",
@@ -1659,7 +1907,7 @@ with tab4:
                                 # Vérifier unicité si changement de période
                                 if new_periode != periode_courante:
                                     conflit = df_demandes[
-                                        (df_demandes.index != idx)
+                                        (df_demandes["Demande_ID"] != demande_id_courante)
                                         & (
                                             df_demandes["Email"].str.lower()
                                             == current_user_email
@@ -1681,26 +1929,28 @@ with tab4:
                                         t["room_id"] for t in all_matchs_triangulaires
                                     }
 
-                                    df_demandes.at[idx, "Timestamp"] = (
-                                        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                    )
-                                    df_demandes.at[idx, "Periode"] = new_periode
-                                    df_demandes.at[idx, "Specialite"] = new_spec
-                                    df_demandes.at[idx, "Hopital_Actuel"] = (
-                                        new_hop_actuel
-                                    )
-                                    df_demandes.at[idx, "Hopitaux_Souhaites"] = (
-                                        serialize_hospitals(new_souhaites)
-                                    )
-                                    if save_demandes(df_demandes):
+                                    update_data = {
+                                        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                        "Periode": new_periode,
+                                        "Specialite": new_spec,
+                                        "Hopital_Actuel": new_hop_actuel,
+                                        "Hopitaux_Souhaites": serialize_hospitals(new_souhaites),
+                                    }
+
+                                    if update_demande_firestore(demande_id_courante, update_data):
+                                        df_maj = df_demandes.copy()
+                                        mask = df_maj["Demande_ID"] == demande_id_courante
+                                        for k, v in update_data.items():
+                                            df_maj.loc[mask, k] = v
+
                                         trigger_new_match_emails(
                                             anciens_rooms=anciens_rooms_avant_modif,
-                                            df_demandes_maj=df_demandes,
+                                            df_demandes_maj=df_maj,
                                             df_utilisateurs=df_utilisateurs,
                                             df_messages=df_messages,
                                         )
                                         st.success(
-                                            "Votre annonce a été mise à jour avec succès !"
+                                            "Votre annonce a été mise à jour avec succès dans Firestore !"
                                         )
                                         st.rerun()
 
@@ -1708,25 +1958,22 @@ with tab4:
                     with col_del:
                         st.markdown("##### Option 2 : Supprimer l'annonce")
                         st.caption(
-                            "Cette action retirera définitivement votre demande de la feuille Google Sheets et fermera les salons associés."
+                            "Cette action retirera définitivement votre offre de la base Firestore et fermera les salons associés."
                         )
                         confirm_check = st.checkbox(
                             "Je confirme vouloir supprimer définitivement cette offre",
-                            key=f"confirm_del_{idx}",
+                            key=f"confirm_del_{demande_id_courante}",
                         )
                         if st.button(
                             "Confirmer la suppression",
-                            key=f"btn_del_{idx}",
+                            key=f"btn_del_{demande_id_courante}",
                             type="secondary",
                             disabled=not confirm_check,
                             use_container_width=True,
                         ):
-                            df_restant = df_demandes.drop(index=idx).reset_index(
-                                drop=True
-                            )
-                            if save_demandes(df_restant):
+                            if delete_demande_firestore(demande_id_courante):
                                 st.success(
-                                    f"Votre offre pour la période {periode_courante} a été supprimée."
+                                    f"Votre offre pour la période {periode_courante} a été supprimée de Firestore."
                                 )
                                 st.rerun()
 
@@ -1765,7 +2012,7 @@ with tab4:
 
 
 # ---------------------------------------------------------------------------
-# 10. PIED DE PAGE (FOOTER GLOBAL)
+# 12. PIED DE PAGE (FOOTER GLOBAL)
 # ---------------------------------------------------------------------------
 st.markdown("---")
 st.markdown(
