@@ -239,24 +239,53 @@ st.markdown(
         color: #1d4ed8 !important;
     }
 
-    /* Badges multiselects sélectionnés */
+    /* Badges multiselects sélectionnés (Hôpitaux souhaités) */
     [data-baseweb="tag"] {
-        background-color: #e2e8f0 !important;
-        color: #0f172a !important;
+        background-color: #0056b3 !important;
         border-radius: 6px !important;
     }
 
-    [data-baseweb="tag"] span {
-        color: #0f172a !important;
+    [data-baseweb="tag"] span,
+    [data-baseweb="tag"] div,
+    [data-baseweb="tag"] * {
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
+        font-weight: 700 !important;
     }
 
-    /* Boutons de commande */
+    [data-baseweb="tag"] svg {
+        fill: #FFFFFF !important;
+        color: #FFFFFF !important;
+    }
+
+    /* Boutons de commande primaires & soumission de formulaire ("Publier ma demande de permutation") */
     button[kind="primary"],
+    button[kind="primaryFormSubmit"],
+    [data-testid="stFormSubmitButton"] > button,
     .stButton > button[type="submit"] {
-        background-color: #1d4ed8 !important;
-        color: #ffffff !important;
+        background-color: #0056b3 !important;
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
         border: none !important;
-        font-weight: 600 !important;
+        font-weight: 700 !important;
+    }
+
+    button[kind="primary"] *,
+    button[kind="primaryFormSubmit"] *,
+    [data-testid="stFormSubmitButton"] > button *,
+    .stButton > button[type="submit"] * {
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
+        font-weight: 700 !important;
+    }
+
+    button[kind="primary"]:hover,
+    button[kind="primaryFormSubmit"]:hover,
+    [data-testid="stFormSubmitButton"] > button:hover,
+    .stButton > button[type="submit"]:hover {
+        background-color: #004494 !important;
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
     }
 
     button[kind="secondary"],
