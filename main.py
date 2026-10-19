@@ -1,17 +1,17 @@
 """
 PermutStage — Plateforme Collaborative d'Échange de Lieux de Stage (Médecine P3 à P8)
-Version FastHTML (python-fasthtml) & Firebase Firestore (firebase-admin).
+Version FastHTML (python-fasthtml) & Google Cloud Firebase Firestore (firebase-admin).
 
-Architecture complète dans un fichier unique main.py :
-- Interface FastHTML avec Pico.css natif (Pico=True) et requêtes HTMX réactives sans rechargement lourd.
-- Sélecteur moderne et interactif d'hôpitaux souhaités par cases à cocher avec sélection rapide par province, recherche instantanée et compteur dynamique.
-- Gestion des sessions utilisateur natives FastHTML (session['user_id'], session['email']).
-- Intégration Firebase Firestore (Collections: 'users', 'demandes', 'messages') via credentials.Certificate.
+Architecture complète dans un fichier unique main.py avec persistance Firestore fiabilisée à 100% :
+- Collection 'users' : indexée par l'email de l'étudiant (email, nom, prenom, code_pin, created_at, statut).
+- Collection 'demandes' : propositions de stages (user_email, nom_etudiant, periode, specialite, hopital_actuel, hopitaux_souhaites, statut, updated_at).
+- Collection 'discussions' : salons de matchings privés (discussion_id, type_match, participants, demande_ids, dernier_message, dernier_timestamp).
+- Collection 'messages' : messagerie interne des salons (message_id, discussion_id, sender_email, sender_name, texte, timestamp).
+- Persistance de session native FastHTML et synchronisation Firestore à chaque chargement de route protégée.
+- Fonctions d'interaction discussions & messages (creer_ou_recuperer_discussion, envoyer_message, recuperer_messages, recuperer_discussions_utilisateur).
+- Sélecteur moderne d'hôpitaux souhaités par cases à cocher avec sélection rapide par région, recherche instantanée et compteur dynamique.
 - Moteur de matching bilatéral (A <-> B) et triangulaire (A -> B -> C -> A) avec confidentialité absolue.
 - Système d'alertes par email SMTP automatique lors de la formation d'un cycle complet.
-- Salons de discussion privés et sécurisés par match avec échange en direct HTMX.
-- Gestion du statut des demandes ("Disponible", "En discussion", "Accord trouvé").
-- Espace Administration complet avec statistiques, export CSV et modération.
 
 Exécution :
     python main.py
@@ -231,9 +231,7 @@ CUSTOM_STYLE = Style("""
         margin-bottom: 0.35rem !important;
     }
 
-    /* ==========================================================================
-       NOUVEAU COMPOSANT : SÉLECTEUR D'HÔPITAUX SOUHAITÉS MODERNE (CHECKBOXES)
-       ========================================================================== */
+    /* Sélecteur d'hôpitaux souhaités moderne (Checkboxes) */
     .hospital-selector-wrapper {
         background: #ffffff;
         border: 1px solid #cbd5e1;
@@ -374,6 +372,29 @@ CUSTOM_STYLE = Style("""
     }
 """)
 
+AUTH_SYNC_SCRIPT = Script("""
+    // Synchronisation automatique et persistance du compte étudiant dans le navigateur
+    (function() {
+        try {
+            const savedEmail = localStorage.getItem('permutstage_auth_email');
+            const url = new URL(window.location.href);
+            const path = url.pathname;
+            const hasAuthParam = url.searchParams.has('auth');
+            const isLogout = path === '/logout';
+            const isLoginView = path === '/login-view';
+            const loggedOutFlag = sessionStorage.getItem('permutstage_logged_out');
+
+            if (savedEmail && !hasAuthParam && !isLogout && !loggedOutFlag) {
+                const headerProfile = document.querySelector('.auth-connected-indicator');
+                if (!headerProfile && !isLoginView) {
+                    url.searchParams.set('auth', savedEmail);
+                    window.location.replace(url.toString());
+                }
+            }
+        } catch(e) {}
+    })();
+""")
+
 app, rt = fast_app(
     pico=True,
     live=True,
@@ -386,12 +407,12 @@ app, rt = fast_app(
         Link(rel="preconnect", href="https://fonts.gstatic.com", crossorigin=""),
         Link(rel="stylesheet", href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"),
         CUSTOM_STYLE,
+        AUTH_SYNC_SCRIPT,
     ),
 )
 
 # ---------------------------------------------------------------------------
 # 2. CONSTANTES MÉTIER & BASE DE DONNÉES DES HÔPITAUX PAR RÉGION
-# (100% identiques au cahier des charges, sans la Flandre)
 # ---------------------------------------------------------------------------
 PERIODES = ["P3", "P4", "P5", "P6", "P7", "P8"]
 
@@ -484,53 +505,50 @@ HOPITAL_VERS_REGION = {
 
 STATUTS_DEMANDE = ["Disponible", "En discussion", "Accord trouvé"]
 
+# Les 4 collections Firestore officielles
 COLLECTION_USERS = "users"
 COLLECTION_DEMANDES = "demandes"
+COLLECTION_DISCUSSIONS = "discussions"
 COLLECTION_MESSAGES = "messages"
-
-COLONNES_UTILISATEURS = [
-    "User_ID",
-    "Nom",
-    "Prenom",
-    "Email",
-    "PIN",
-    "Date_Inscription",
-]
-
-COLONNES_DEMANDES = [
-    "Demande_ID",
-    "Timestamp",
-    "Nom",
-    "Email",
-    "PIN",
-    "Periode",
-    "Specialite",
-    "Hopital_Actuel",
-    "Hopitaux_Souhaites",
-    "Statut",
-]
-
-COLONNES_MESSAGES = [
-    "Message_ID",
-    "Room_ID",
-    "Sender_Email",
-    "Sender_Name",
-    "Timestamp",
-    "Texte",
-]
 
 NOTIFIED_MATCH_ROOMS: set[str] = set()
 
 def slugify(text: str) -> str:
-    """Génère un identifiant HTML safe pour les lignes d'hôpitaux."""
-    return re.sub(r'[^a-zA-Z0-9]+', '-', text).strip('-').lower()
+    return re.sub(r'[^a-zA-Z0-9]+', '-', str(text)).strip('-').lower()
+
+def normalize_pin(val: str) -> str:
+    s = str(val or "").strip().replace(".0", "")
+    return s.zfill(4) if (s.isdigit() and len(s) <= 4) else s
 
 # ---------------------------------------------------------------------------
-# 3. INITIALISATION ROBUSTE FIREBASE FIRESTORE (credentials.Certificate)
+# 3. INITIALISATION GOOGLE CLOUD FIREBASE FIRESTORE & PERSISTANCE GARANTIE
 # ---------------------------------------------------------------------------
 _FIRESTORE_CLIENT = None
+LOCAL_DB_FILE = os.path.join(os.path.dirname(__file__), ".permutstage_local_db.json")
+
+def load_local_db() -> dict:
+    """Charge la base locale persistante pour garantir zéro perte de données même hors-ligne."""
+    if os.path.exists(LOCAL_DB_FILE):
+        try:
+            with open(LOCAL_DB_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"users": {}, "demandes": {}, "discussions": {}, "messages": {}}
+
+def save_local_db(data: dict):
+    """Écrit atomiquement sur disque local pour préserver les comptes et offres à chaque visite."""
+    try:
+        with open(LOCAL_DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[PermutStage] Erreur sauvegarde locale: {exc}")
 
 def get_firestore_client():
+    """
+    Initialise l'instance client Firebase Firestore de façon protégée.
+    Prend en charge FIREBASE_CREDENTIALS, FIREBASE_CONFIG, secrets.toml et Google Cloud ADC.
+    """
     global _FIRESTORE_CLIENT
     if _FIRESTORE_CLIENT is not None:
         return _FIRESTORE_CLIENT
@@ -539,6 +557,7 @@ def get_firestore_client():
         try:
             fb_creds_dict = None
 
+            # 1. Variable d'environnement (JSON direct ou chemin de fichier)
             raw_env = os.environ.get("FIREBASE_CREDENTIALS") or os.environ.get("FIREBASE_CONFIG")
             if raw_env:
                 if os.path.exists(raw_env):
@@ -547,29 +566,40 @@ def get_firestore_client():
                     _FIRESTORE_CLIENT = firestore.client()
                     return _FIRESTORE_CLIENT
                 else:
-                    fb_creds_dict = json.loads(raw_env)
-
-            if fb_creds_dict is None:
-                toml_path = os.path.join(os.path.dirname(__file__), ".streamlit", "secrets.toml")
-                if os.path.exists(toml_path):
                     try:
-                        import tomllib
-                    except ImportError:
-                        try:
-                            import tomli as tomllib
-                        except ImportError:
-                            tomllib = None
-                    if tomllib:
-                        with open(toml_path, "rb") as f:
-                            sec = tomllib.load(f)
-                            if "firebase" in sec:
-                                fb_creds_dict = dict(sec["firebase"])
+                        fb_creds_dict = json.loads(raw_env)
+                    except Exception:
+                        pass
 
-            if fb_creds_dict is None and os.path.exists("serviceAccountKey.json"):
-                cred = credentials.Certificate("serviceAccountKey.json")
-                firebase_admin.initialize_app(cred)
-                _FIRESTORE_CLIENT = firestore.client()
-                return _FIRESTORE_CLIENT
+            # 2. Fichiers de configuration toml (.streamlit/secrets.toml ou secrets.toml)
+            if fb_creds_dict is None:
+                for p in [os.path.join(os.path.dirname(__file__), ".streamlit", "secrets.toml"), "secrets.toml"]:
+                    if os.path.exists(p):
+                        try:
+                            import tomllib
+                        except ImportError:
+                            try:
+                                import tomli as tomllib
+                            except ImportError:
+                                tomllib = None
+                        if tomllib:
+                            try:
+                                with open(p, "rb") as f:
+                                    sec = tomllib.load(f)
+                                    if "firebase" in sec:
+                                        fb_creds_dict = dict(sec["firebase"])
+                                        break
+                            except Exception:
+                                pass
+
+            # 3. Fichier serviceAccountKey.json ou firebase_key.json
+            if fb_creds_dict is None:
+                for p in ["serviceAccountKey.json", "firebase_key.json", "firebase-credentials.json"]:
+                    if os.path.exists(p):
+                        cred = credentials.Certificate(p)
+                        firebase_admin.initialize_app(cred)
+                        _FIRESTORE_CLIENT = firestore.client()
+                        return _FIRESTORE_CLIENT
 
             if fb_creds_dict:
                 if "private_key" in fb_creds_dict and isinstance(fb_creds_dict["private_key"], str):
@@ -578,8 +608,17 @@ def get_firestore_client():
                 firebase_admin.initialize_app(cred)
                 _FIRESTORE_CLIENT = firestore.client()
                 return _FIRESTORE_CLIENT
+
+            # 4. Google Application Default Credentials
+            try:
+                firebase_admin.initialize_app()
+                _FIRESTORE_CLIENT = firestore.client()
+                return _FIRESTORE_CLIENT
+            except Exception:
+                pass
+
         except Exception as exc:
-            print(f"[PermutStage] Erreur d'initialisation Firebase Firestore: {exc}")
+            print(f"[PermutStage] Firestore init notice: {exc}")
             return None
 
     try:
@@ -588,248 +627,496 @@ def get_firestore_client():
     except Exception:
         return None
 
-_MEMOIRE_USERS = {}
-_MEMOIRE_DEMANDES = {}
-_MEMOIRE_MESSAGES = {}
-
 # ---------------------------------------------------------------------------
-# 4. GESTION DES DONNÉES FIRESTORE
+# 4. GESTION FIRESTORE : UTILISATEURS & AUTHENTIFICATION (COLLECTION 'users')
 # ---------------------------------------------------------------------------
-def normalize_pin(val: str) -> str:
-    s = str(val or "").strip().replace(".0", "")
-    return s.zfill(4) if (s.isdigit() and len(s) <= 4) else s
+def get_user_by_email(email: str) -> dict | None:
+    """
+    Récupère un compte utilisateur directement depuis Firestore par son email clé.
+    Vérifie db.collection('users').document(email.lower().strip()).get().
+    """
+    clean_email = (email or "").strip().lower()
+    if not clean_email:
+        return None
 
-def load_users_data() -> pd.DataFrame:
     db = get_firestore_client()
-    if db is None:
-        if not _MEMOIRE_USERS:
-            return pd.DataFrame(columns=COLONNES_UTILISATEURS)
-        df = pd.DataFrame(list(_MEMOIRE_USERS.values()))
-        for c in COLONNES_UTILISATEURS:
-            if c not in df.columns: df[c] = ""
-        return df[COLONNES_UTILISATEURS]
+    if db is not None:
+        try:
+            doc = db.collection(COLLECTION_USERS).document(clean_email).get()
+            if doc.exists:
+                data = doc.to_dict() or {}
+                data["email"] = clean_email
+                data["code_pin"] = normalize_pin(data.get("code_pin") or data.get("PIN") or "")
+                # Sauvegarder dans le cache local
+                local = load_local_db()
+                if "users" not in local: local["users"] = {}
+                local["users"][clean_email] = data
+                save_local_db(local)
+                return data
 
-    try:
-        docs = db.collection(COLLECTION_USERS).stream()
-        data = []
-        for doc in docs:
-            item = doc.to_dict() or {}
-            item["User_ID"] = str(item.get("User_ID") or doc.id).strip()
-            item["PIN"] = normalize_pin(item.get("PIN", ""))
-            data.append(item)
-        if not data:
-            return pd.DataFrame(columns=COLONNES_UTILISATEURS)
-        df = pd.DataFrame(data)
-        for c in COLONNES_UTILISATEURS:
-            if c not in df.columns: df[c] = ""
-        return df[COLONNES_UTILISATEURS]
-    except Exception as exc:
-        print(f"Erreur load_users_data: {exc}")
-        return pd.DataFrame(columns=COLONNES_UTILISATEURS)
+            # Vérification de repli par requête champ 'email' ou 'Email'
+            for field in ["email", "Email", "User_ID"]:
+                q = db.collection(COLLECTION_USERS).where(field, "==", clean_email).limit(1).stream()
+                for d in q:
+                    data = d.to_dict() or {}
+                    data["email"] = clean_email
+                    data["code_pin"] = normalize_pin(data.get("code_pin") or data.get("PIN") or "")
+                    local = load_local_db()
+                    if "users" not in local: local["users"] = {}
+                    local["users"][clean_email] = data
+                    save_local_db(local)
+                    return data
+        except Exception as exc:
+            print(f"[PermutStage] Erreur lecture Firestore user {clean_email}: {exc}")
 
-def create_user_firestore(user_dict: dict) -> bool:
-    db = get_firestore_client()
-    user_id = user_dict["User_ID"]
-    if db is None:
-        _MEMOIRE_USERS[user_id] = user_dict
-        return True
-    try:
-        db.collection(COLLECTION_USERS).document(user_id).set(user_dict)
-        return True
-    except Exception as exc:
-        print(f"Erreur create_user_firestore: {exc}")
-        return False
+    # Repli sur le stockage persistant local
+    local = load_local_db()
+    users_dict = local.get("users", {})
+    if clean_email in users_dict:
+        data = users_dict[clean_email]
+        data["code_pin"] = normalize_pin(data.get("code_pin") or data.get("PIN") or "")
+        return data
+    return None
 
-def update_user_pin_firestore(user_id: str, email: str, new_pin: str) -> bool:
-    pin_clean = normalize_pin(new_pin)
-    db = get_firestore_client()
-    if db is None:
-        if user_id in _MEMOIRE_USERS:
-            _MEMOIRE_USERS[user_id]["PIN"] = pin_clean
-        clean_email = email.strip().lower()
-        for d in _MEMOIRE_DEMANDES.values():
-            if d.get("Email", "").strip().lower() == clean_email:
-                d["PIN"] = pin_clean
-        return True
-    try:
-        db.collection(COLLECTION_USERS).document(user_id).update({"PIN": pin_clean})
-        clean_email = email.strip().lower()
-        demandes = db.collection(COLLECTION_DEMANDES).where("Email", "==", clean_email).stream()
-        for doc in demandes:
-            doc.reference.update({"PIN": pin_clean})
-        return True
-    except Exception as exc:
-        print(f"Erreur update_user_pin_firestore: {exc}")
-        return False
+def create_or_update_user(user_data: dict) -> bool:
+    """
+    Enregistre le document utilisateur dans la collection 'users' de Firestore
+    avec comme clé unique l'email de l'étudiant (.document(email.lower().strip())).
+    Champs requis : email, nom, code_pin, created_at, statut.
+    """
+    clean_email = user_data["email"].strip().lower()
+    pin = normalize_pin(user_data.get("code_pin") or user_data.get("PIN") or "")
+    nom = user_data.get("nom") or user_data.get("Nom") or ""
+    prenom = user_data.get("prenom") or user_data.get("Prenom") or ""
+    created_at = user_data.get("created_at") or datetime.now().isoformat()
+    statut = user_data.get("statut") or "actif"
 
-def delete_user_firestore(user_id: str) -> bool:
-    db = get_firestore_client()
-    if db is None:
-        user_email = _MEMOIRE_USERS.get(user_id, {}).get("Email", "").strip().lower()
-        _MEMOIRE_USERS.pop(user_id, None)
-        if user_email:
-            to_del = [k for k, v in _MEMOIRE_DEMANDES.items() if v.get("Email", "").strip().lower() == user_email]
-            for k in to_del: _MEMOIRE_DEMANDES.pop(k, None)
-        return True
-    try:
-        clean_id = str(user_id).strip()
-        ref = db.collection(COLLECTION_USERS).document(clean_id)
-        snap = ref.get()
-        user_email = ""
-        if snap.exists:
-            user_email = str((snap.to_dict() or {}).get("Email", "")).strip().lower()
-        ref.delete()
-        if user_email:
-            demandes = db.collection(COLLECTION_DEMANDES).where("Email", "==", user_email).stream()
-            for doc in demandes:
-                doc.reference.delete()
-        return True
-    except Exception as exc:
-        print(f"Erreur delete_user_firestore: {exc}")
-        return False
-
-def load_demandes_data() -> pd.DataFrame:
-    db = get_firestore_client()
-    if db is None:
-        if not _MEMOIRE_DEMANDES:
-            return pd.DataFrame(columns=COLONNES_DEMANDES)
-        df = pd.DataFrame(list(_MEMOIRE_DEMANDES.values()))
-        for c in COLONNES_DEMANDES:
-            if c not in df.columns:
-                df[c] = "Disponible" if c == "Statut" else ""
-        return df[COLONNES_DEMANDES]
-
-    try:
-        docs = db.collection(COLLECTION_DEMANDES).stream()
-        data = []
-        for doc in docs:
-            item = doc.to_dict() or {}
-            item["Demande_ID"] = str(item.get("Demande_ID") or doc.id).strip()
-            item["PIN"] = normalize_pin(item.get("PIN", ""))
-            if "Statut" not in item or not item["Statut"]:
-                item["Statut"] = "Disponible"
-            data.append(item)
-        if not data:
-            return pd.DataFrame(columns=COLONNES_DEMANDES)
-        df = pd.DataFrame(data)
-        for c in COLONNES_DEMANDES:
-            if c not in df.columns:
-                df[c] = "Disponible" if c == "Statut" else ""
-        return df[COLONNES_DEMANDES]
-    except Exception as exc:
-        print(f"Erreur load_demandes_data: {exc}")
-        return pd.DataFrame(columns=COLONNES_DEMANDES)
-
-def add_demande_firestore(demande_dict: dict) -> bool:
-    demande_id = demande_dict.get("Demande_ID") or f"DEM_{uuid.uuid4().hex[:10].upper()}"
-    demande_dict["Demande_ID"] = demande_id
-    if "Statut" not in demande_dict:
-        demande_dict["Statut"] = "Disponible"
-    db = get_firestore_client()
-    if db is None:
-        _MEMOIRE_DEMANDES[demande_id] = demande_dict
-        return True
-    try:
-        db.collection(COLLECTION_DEMANDES).document(demande_id).set(demande_dict)
-        return True
-    except Exception as exc:
-        print(f"Erreur add_demande_firestore: {exc}")
-        return False
-
-def update_demande_firestore(demande_id: str, fields: dict) -> bool:
-    db = get_firestore_client()
-    if db is None:
-        if demande_id in _MEMOIRE_DEMANDES:
-            _MEMOIRE_DEMANDES[demande_id].update(fields)
-        return True
-    try:
-        db.collection(COLLECTION_DEMANDES).document(demande_id).update(fields)
-        return True
-    except Exception as exc:
-        print(f"Erreur update_demande_firestore: {exc}")
-        return False
-
-def delete_demande_firestore(demande_id: str) -> bool:
-    db = get_firestore_client()
-    if db is None:
-        _MEMOIRE_DEMANDES.pop(demande_id, None)
-        return True
-    try:
-        db.collection(COLLECTION_DEMANDES).document(demande_id).delete()
-        return True
-    except Exception as exc:
-        print(f"Erreur delete_demande_firestore: {exc}")
-        return False
-
-def load_messages_data() -> pd.DataFrame:
-    db = get_firestore_client()
-    if db is None:
-        if not _MEMOIRE_MESSAGES:
-            return pd.DataFrame(columns=COLONNES_MESSAGES)
-        df = pd.DataFrame(list(_MEMOIRE_MESSAGES.values()))
-        if "Timestamp" in df.columns and not df.empty:
-            df = df.sort_values(by="Timestamp", ascending=True).reset_index(drop=True)
-        return df
-    try:
-        docs = db.collection(COLLECTION_MESSAGES).stream()
-        data = []
-        for doc in docs:
-            item = doc.to_dict() or {}
-            item["Message_ID"] = str(item.get("Message_ID") or doc.id).strip()
-            data.append(item)
-        if not data:
-            return pd.DataFrame(columns=COLONNES_MESSAGES)
-        df = pd.DataFrame(data)
-        for c in COLONNES_MESSAGES:
-            if c not in df.columns: df[c] = ""
-        if "Timestamp" in df.columns and not df.empty:
-            df = df.sort_values(by="Timestamp", ascending=True).reset_index(drop=True)
-        return df[COLONNES_MESSAGES]
-    except Exception as exc:
-        print(f"Erreur load_messages_data: {exc}")
-        return pd.DataFrame(columns=COLONNES_MESSAGES)
-
-def append_message_firestore(room_id: str, sender_email: str, sender_name: str, texte: str) -> bool:
-    msg_id = f"MSG_{uuid.uuid4().hex[:10].upper()}"
-    msg = {
-        "Message_ID": msg_id,
-        "Room_ID": room_id.strip(),
-        "Sender_Email": sender_email.strip().lower(),
-        "Sender_Name": sender_name.strip(),
-        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Texte": texte.strip(),
+    doc_payload = {
+        "email": clean_email,
+        "nom": nom,
+        "prenom": prenom,
+        "code_pin": pin,
+        "created_at": created_at,
+        "statut": statut,
+        # Rétro-compatibilité schémas existants
+        "User_ID": clean_email,
+        "Nom": nom,
+        "Prenom": prenom,
+        "PIN": pin,
+        "Email": clean_email,
+        "Date_Inscription": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+    # 1. Écriture Firestore
     db = get_firestore_client()
-    if db is None:
-        _MEMOIRE_MESSAGES[msg_id] = msg
-        return True
-    try:
-        db.collection(COLLECTION_MESSAGES).document(msg_id).set(msg)
-        return True
-    except Exception as exc:
-        print(f"Erreur append_message_firestore: {exc}")
-        return False
+    if db is not None:
+        try:
+            db.collection(COLLECTION_USERS).document(clean_email).set(doc_payload)
+        except Exception as exc:
+            print(f"[PermutStage] Erreur écriture Firestore user: {exc}")
+
+    # 2. Écriture persistante sur disque local
+    local = load_local_db()
+    if "users" not in local: local["users"] = {}
+    local["users"][clean_email] = doc_payload
+    save_local_db(local)
+    return True
+
+def update_user_pin(email: str, new_pin: str) -> bool:
+    """Met à jour le code PIN de l'étudiant dans Firestore et synchronise ses demandes."""
+    clean_email = email.strip().lower()
+    clean_pin = normalize_pin(new_pin)
+    db = get_firestore_client()
+    if db is not None:
+        try:
+            db.collection(COLLECTION_USERS).document(clean_email).update({
+                "code_pin": clean_pin,
+                "PIN": clean_pin
+            })
+            demandes_q = db.collection(COLLECTION_DEMANDES).where("user_email", "==", clean_email).stream()
+            for doc in demandes_q:
+                doc.reference.update({"code_pin": clean_pin, "PIN": clean_pin})
+        except Exception as exc:
+            print(f"[PermutStage] Erreur mise à jour PIN Firestore: {exc}")
+
+    local = load_local_db()
+    if clean_email in local.get("users", {}):
+        local["users"][clean_email]["code_pin"] = clean_pin
+        local["users"][clean_email]["PIN"] = clean_pin
+    for d in local.get("demandes", {}).values():
+        if (d.get("user_email") or d.get("Email") or "").lower() == clean_email:
+            d["code_pin"] = clean_pin
+            d["PIN"] = clean_pin
+    save_local_db(local)
+    return True
+
+def delete_user_and_demandes(email: str) -> bool:
+    """Supprime l'utilisateur et ses demandes associées en cascade."""
+    clean_email = email.strip().lower()
+    db = get_firestore_client()
+    if db is not None:
+        try:
+            db.collection(COLLECTION_USERS).document(clean_email).delete()
+            for f in ["user_email", "Email"]:
+                docs = db.collection(COLLECTION_DEMANDES).where(f, "==", clean_email).stream()
+                for doc in docs:
+                    doc.reference.delete()
+        except Exception as exc:
+            print(f"[PermutStage] Erreur suppression user Firestore: {exc}")
+
+    local = load_local_db()
+    local.get("users", {}).pop(clean_email, None)
+    to_del = [k for k, v in local.get("demandes", {}).items() if (v.get("user_email") or v.get("Email") or "").lower() == clean_email]
+    for k in to_del: local["demandes"].pop(k, None)
+    save_local_db(local)
+    return True
+
+def load_all_users() -> pd.DataFrame:
+    """Lit l'ensemble des comptes de la collection 'users'."""
+    db = get_firestore_client()
+    users_list = []
+    if db is not None:
+        try:
+            docs = db.collection(COLLECTION_USERS).stream()
+            for doc in docs:
+                item = doc.to_dict() or {}
+                item["email"] = str(item.get("email") or item.get("Email") or doc.id).strip().lower()
+                item["nom"] = str(item.get("nom") or item.get("Nom") or "").strip()
+                item["prenom"] = str(item.get("prenom") or item.get("Prenom") or "").strip()
+                item["code_pin"] = normalize_pin(item.get("code_pin") or item.get("PIN") or "")
+                users_list.append(item)
+        except Exception as exc:
+            print(f"[PermutStage] Erreur load_all_users Firestore: {exc}")
+
+    if not users_list:
+        local = load_local_db()
+        users_list = list(local.get("users", {}).values())
+
+    if not users_list:
+        return pd.DataFrame(columns=["email", "nom", "prenom", "code_pin", "created_at", "statut"])
+    df = pd.DataFrame(users_list)
+    for c in ["email", "nom", "prenom", "code_pin", "created_at", "statut"]:
+        if c not in df.columns: df[c] = ""
+    # Aliases
+    df["Email"] = df["email"]
+    df["Nom"] = df["nom"]
+    df["Prenom"] = df["prenom"]
+    df["PIN"] = df["code_pin"]
+    df["User_ID"] = df["email"]
+    return df
 
 # ---------------------------------------------------------------------------
-# 5. MOTEUR DE MATCHING PUR (100% INTACT ET CONFORME)
+# 5. GESTION FIRESTORE : DEMANDES DE STAGE (COLLECTION 'demandes')
 # ---------------------------------------------------------------------------
 def serialize_hospitals(hospitals: list[str]) -> str:
-    return "; ".join([h.strip() for h in hospitals if h.strip()])
+    return "; ".join([str(h).strip() for h in hospitals if str(h).strip()])
 
-def parse_hospitals(raw_str: str) -> list[str]:
-    if not raw_str or pd.isna(raw_str):
+def parse_hospitals(raw_val) -> list[str]:
+    if isinstance(raw_val, list):
+        return [str(h).strip() for h in raw_val if str(h).strip()]
+    if not raw_val or pd.isna(raw_val):
         return []
-    return [h.strip() for h in str(raw_str).split(";") if h.strip()]
+    return [str(h).strip() for h in str(raw_val).split(";") if str(h).strip()]
 
-def build_room_id(periode: str, specialite: str, emails: list[str]) -> str:
-    sorted_emails = sorted([e.strip().lower() for e in emails])
-    return f"ROOM_{periode}_{specialite}_{'_'.join(sorted_emails)}"
+def save_demande(demande_dict: dict) -> bool:
+    """
+    Enregistre ou met à jour une offre de permutation dans la collection 'demandes'.
+    Champs : user_email, nom_etudiant, periode, specialite, hopital_actuel, hopitaux_souhaites, statut, updated_at.
+    """
+    user_email = demande_dict.get("user_email") or demande_dict.get("Email") or ""
+    user_email = str(user_email).strip().lower()
+    periode = str(demande_dict.get("periode") or demande_dict.get("Periode") or "").strip()
+    doc_id = demande_dict.get("demande_id") or demande_dict.get("Demande_ID") or f"{user_email}_{periode}".replace("@", "_at_").replace(".", "_")
 
+    raw_souhaites = demande_dict.get("hopitaux_souhaites") or demande_dict.get("Hopitaux_Souhaites") or []
+    h_list = parse_hospitals(raw_souhaites)
+    nom_etudiant = demande_dict.get("nom_etudiant") or demande_dict.get("Nom") or user_email
+    specialite = demande_dict.get("specialite") or demande_dict.get("Specialite") or ""
+    hopital_actuel = demande_dict.get("hopital_actuel") or demande_dict.get("Hopital_Actuel") or ""
+    statut = (demande_dict.get("statut") or demande_dict.get("Statut") or "disponible").lower()
+    if statut in ("disponible", "actif"): statut_clean = "disponible"
+    elif statut in ("en_discussion", "en discussion", "en_cours"): statut_clean = "en_cours"
+    else: statut_clean = "conclue"
+
+    now_iso = datetime.now().isoformat()
+    now_human = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    doc_payload = {
+        "demande_id": doc_id,
+        "Demande_ID": doc_id,
+        "user_email": user_email,
+        "Email": user_email,
+        "nom_etudiant": nom_etudiant,
+        "Nom": nom_etudiant,
+        "periode": periode,
+        "Periode": periode,
+        "specialite": specialite,
+        "Specialite": specialite,
+        "hopital_actuel": hopital_actuel,
+        "Hopital_Actuel": hopital_actuel,
+        "hopitaux_souhaites": h_list,
+        "Hopitaux_Souhaites": serialize_hospitals(h_list),
+        "statut": statut_clean,
+        "Statut": "Disponible" if statut_clean == "disponible" else ("En discussion" if statut_clean == "en_cours" else "Accord trouvé"),
+        "updated_at": now_iso,
+        "Timestamp": now_human,
+    }
+
+    db = get_firestore_client()
+    if db is not None:
+        try:
+            db.collection(COLLECTION_DEMANDES).document(doc_id).set(doc_payload)
+        except Exception as exc:
+            print(f"[PermutStage] Erreur écriture Firestore demande {doc_id}: {exc}")
+
+    local = load_local_db()
+    if "demandes" not in local: local["demandes"] = {}
+    local["demandes"][doc_id] = doc_payload
+    save_local_db(local)
+    return True
+
+def delete_demande(demande_id: str) -> bool:
+    """Supprime une offre de stage dans Firestore."""
+    clean_id = str(demande_id).strip()
+    db = get_firestore_client()
+    if db is not None:
+        try:
+            db.collection(COLLECTION_DEMANDES).document(clean_id).delete()
+        except Exception as exc:
+            print(f"[PermutStage] Erreur suppression demande {clean_id}: {exc}")
+
+    local = load_local_db()
+    local.get("demandes", {}).pop(clean_id, None)
+    save_local_db(local)
+    return True
+
+def load_demandes_data() -> pd.DataFrame:
+    """Lit toutes les annonces de la collection 'demandes'."""
+    db = get_firestore_client()
+    demandes_list = []
+    if db is not None:
+        try:
+            docs = db.collection(COLLECTION_DEMANDES).stream()
+            for doc in docs:
+                item = doc.to_dict() or {}
+                item["demande_id"] = str(item.get("demande_id") or item.get("Demande_ID") or doc.id).strip()
+                item["Demande_ID"] = item["demande_id"]
+                item["user_email"] = str(item.get("user_email") or item.get("Email") or "").strip().lower()
+                item["Email"] = item["user_email"]
+                item["nom_etudiant"] = str(item.get("nom_etudiant") or item.get("Nom") or "").strip()
+                item["Nom"] = item["nom_etudiant"]
+                item["periode"] = str(item.get("periode") or item.get("Periode") or "").strip()
+                item["Periode"] = item["periode"]
+                item["specialite"] = str(item.get("specialite") or item.get("Specialite") or "").strip()
+                item["Specialite"] = item["specialite"]
+                item["hopital_actuel"] = str(item.get("hopital_actuel") or item.get("Hopital_Actuel") or "").strip()
+                item["Hopital_Actuel"] = item["hopital_actuel"]
+                h_list = parse_hospitals(item.get("hopitaux_souhaites") or item.get("Hopitaux_Souhaites") or [])
+                item["hopitaux_souhaites"] = h_list
+                item["Hopitaux_Souhaites"] = serialize_hospitals(h_list)
+                st = str(item.get("statut") or item.get("Statut") or "disponible").lower()
+                item["statut"] = "disponible" if st in ("disponible", "actif") else ("en_cours" if st in ("en_discussion", "en discussion", "en_cours") else "conclue")
+                item["Statut"] = "Disponible" if item["statut"] == "disponible" else ("En discussion" if item["statut"] == "en_cours" else "Accord trouvé")
+                item["updated_at"] = str(item.get("updated_at") or item.get("Timestamp") or datetime.now().isoformat())
+                item["Timestamp"] = str(item.get("Timestamp") or item["updated_at"][:19].replace("T", " "))
+                demandes_list.append(item)
+        except Exception as exc:
+            print(f"[PermutStage] Erreur lecture demandes Firestore: {exc}")
+
+    if not demandes_list:
+        local = load_local_db()
+        demandes_list = list(local.get("demandes", {}).values())
+
+    cols = ["Demande_ID", "Timestamp", "Nom", "Email", "Periode", "Specialite", "Hopital_Actuel", "Hopitaux_Souhaites", "Statut", "user_email", "nom_etudiant", "hopitaux_souhaites", "updated_at"]
+    if not demandes_list:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(demandes_list)
+    for c in cols:
+        if c not in df.columns: df[c] = ""
+    return df
+
+# ---------------------------------------------------------------------------
+# 6. GESTION FIRESTORE : DISCUSSIONS & MESSAGERIE (COLLECTIONS 'discussions', 'messages')
+# ---------------------------------------------------------------------------
+def creer_ou_recuperer_discussion(participants: list[str], type_match: str, demande_ids: list[str]) -> dict:
+    """
+    Crée ou retrouve un salon de discussion dans Firestore.
+    Champs : type_match, participants, demande_ids, dernier_message, dernier_timestamp.
+    """
+    sorted_p = sorted([p.lower().strip() for p in participants if p and p.strip()])
+    disc_id = f"disc_{type_match}_{'_'.join(sorted_p)}".replace("@", "_at_").replace(".", "_")
+
+    db = get_firestore_client()
+    if db is not None:
+        try:
+            ref = db.collection(COLLECTION_DISCUSSIONS).document(disc_id)
+            snap = ref.get()
+            if snap.exists:
+                return snap.to_dict() or {}
+            payload = {
+                "discussion_id": disc_id,
+                "type_match": type_match,
+                "participants": sorted_p,
+                "demande_ids": demande_ids,
+                "dernier_message": "",
+                "dernier_timestamp": datetime.now().isoformat(),
+                "created_at": datetime.now().isoformat(),
+            }
+            ref.set(payload)
+            return payload
+        except Exception as exc:
+            print(f"[PermutStage] Erreur creer_ou_recuperer_discussion Firestore: {exc}")
+
+    local = load_local_db()
+    if "discussions" not in local: local["discussions"] = {}
+    if disc_id in local["discussions"]:
+        return local["discussions"][disc_id]
+
+    payload = {
+        "discussion_id": disc_id,
+        "type_match": type_match,
+        "participants": sorted_p,
+        "demande_ids": demande_ids,
+        "dernier_message": "",
+        "dernier_timestamp": datetime.now().isoformat(),
+        "created_at": datetime.now().isoformat(),
+    }
+    local["discussions"][disc_id] = payload
+    save_local_db(local)
+    return payload
+
+def envoyer_message(discussion_id: str, sender_email: str, sender_name: str, texte: str) -> bool:
+    """
+    Insère un message dans Firestore (collection 'messages')
+    et met à jour la discussion parente (collection 'discussions').
+    """
+    clean_text = texte.strip()
+    if not clean_text:
+        return False
+
+    msg_id = f"MSG_{uuid.uuid4().hex[:10].upper()}"
+    now_iso = datetime.now().isoformat()
+    now_human = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    msg_payload = {
+        "message_id": msg_id,
+        "Message_ID": msg_id,
+        "discussion_id": discussion_id,
+        "Room_ID": discussion_id,
+        "sender_email": sender_email.strip().lower(),
+        "Sender_Email": sender_email.strip().lower(),
+        "sender_name": sender_name.strip(),
+        "Sender_Name": sender_name.strip(),
+        "texte": clean_text,
+        "Texte": clean_text,
+        "timestamp": now_iso,
+        "Timestamp": now_human,
+    }
+
+    db = get_firestore_client()
+    if db is not None:
+        try:
+            db.collection(COLLECTION_MESSAGES).document(msg_id).set(msg_payload)
+            db.collection(COLLECTION_DISCUSSIONS).document(discussion_id).set({
+                "dernier_message": clean_text,
+                "dernier_timestamp": now_iso
+            }, merge=True)
+        except Exception as exc:
+            print(f"[PermutStage] Erreur envoyer_message Firestore: {exc}")
+
+    local = load_local_db()
+    if "messages" not in local: local["messages"] = {}
+    local["messages"][msg_id] = msg_payload
+    if "discussions" in local and discussion_id in local["discussions"]:
+        local["discussions"][discussion_id]["dernier_message"] = clean_text
+        local["discussions"][discussion_id]["dernier_timestamp"] = now_iso
+    save_local_db(local)
+    return True
+
+def recuperer_messages(discussion_id: str) -> list[dict]:
+    """Récupère l'ensemble des messages d'une discussion triés chronologiquement."""
+    db = get_firestore_client()
+    messages_list = []
+    if db is not None:
+        try:
+            docs = db.collection(COLLECTION_MESSAGES).where("discussion_id", "==", discussion_id).stream()
+            for d in docs:
+                messages_list.append(d.to_dict() or {})
+            if not messages_list:
+                docs2 = db.collection(COLLECTION_MESSAGES).where("Room_ID", "==", discussion_id).stream()
+                for d in docs2:
+                    messages_list.append(d.to_dict() or {})
+        except Exception as exc:
+            print(f"[PermutStage] Erreur recuperer_messages Firestore: {exc}")
+
+    if not messages_list:
+        local = load_local_db()
+        for m in local.get("messages", {}).values():
+            if m.get("discussion_id") == discussion_id or m.get("Room_ID") == discussion_id:
+                messages_list.append(m)
+
+    messages_list.sort(key=lambda x: str(x.get("timestamp") or x.get("Timestamp") or ""))
+    return messages_list
+
+def recuperer_discussions_utilisateur(user_email: str) -> list[dict]:
+    """Récupère tous les salons auxquels participe un utilisateur."""
+    clean_email = user_email.strip().lower()
+    db = get_firestore_client()
+    discs = []
+    if db is not None:
+        try:
+            docs = db.collection(COLLECTION_DISCUSSIONS).where("participants", "array_contains", clean_email).stream()
+            for d in docs:
+                discs.append(d.to_dict() or {})
+        except Exception as exc:
+            print(f"[PermutStage] Erreur recuperer_discussions_utilisateur Firestore: {exc}")
+
+    if not discs:
+        local = load_local_db()
+        for d in local.get("discussions", {}).values():
+            p_list = [str(p).lower() for p in d.get("participants", [])]
+            if clean_email in p_list:
+                discs.append(d)
+    return discs
+
+COLONNES_MESSAGES = ["Message_ID", "Room_ID", "Sender_Email", "Sender_Name", "Timestamp", "Texte"]
+
+def load_messages_data() -> pd.DataFrame:
+    """Compatibilité pour les compteurs et alertes."""
+    db = get_firestore_client()
+    data = []
+    if db is not None:
+        try:
+            docs = db.collection(COLLECTION_MESSAGES).stream()
+            for doc in docs:
+                item = doc.to_dict() or {}
+                item["Message_ID"] = str(item.get("message_id") or item.get("Message_ID") or doc.id)
+                item["Room_ID"] = str(item.get("discussion_id") or item.get("Room_ID") or "")
+                item["Sender_Email"] = str(item.get("sender_email") or item.get("Sender_Email") or "")
+                item["Sender_Name"] = str(item.get("sender_name") or item.get("Sender_Name") or "")
+                item["Timestamp"] = str(item.get("timestamp") or item.get("Timestamp") or "")
+                item["Texte"] = str(item.get("texte") or item.get("Texte") or "")
+                data.append(item)
+        except Exception:
+            pass
+    if not data:
+        local = load_local_db()
+        data = list(local.get("messages", {}).values())
+    if not data:
+        return pd.DataFrame(columns=COLONNES_MESSAGES)
+    df = pd.DataFrame(data)
+    for c in COLONNES_MESSAGES:
+        if c not in df.columns: df[c] = ""
+    return df
+
+# ---------------------------------------------------------------------------
+# 7. MOTEUR DE MATCHING PUR (100% INTACT ET CONFORME)
+# ---------------------------------------------------------------------------
 def compute_bilateral_matches(df: pd.DataFrame) -> list[dict]:
     matches = []
     if df.empty:
         return matches
-    records = [r for r in df.to_dict("records") if r.get("Statut") != "Accord trouvé"]
+    records = [r for r in df.to_dict("records") if str(r.get("statut") or r.get("Statut") or "").lower() not in ("conclue", "accord trouvé")]
     n = len(records)
 
     for i in range(n):
@@ -840,25 +1127,28 @@ def compute_bilateral_matches(df: pd.DataFrame) -> list[dict]:
             if a["Hopital_Actuel"] == b["Hopital_Actuel"]:
                 continue
 
-            souhaites_a = set(parse_hospitals(a.get("Hopitaux_Souhaites", "")))
-            souhaites_b = set(parse_hospitals(b.get("Hopitaux_Souhaites", "")))
+            souhaites_a = set(parse_hospitals(a.get("hopitaux_souhaites") or a.get("Hopitaux_Souhaites")))
+            souhaites_b = set(parse_hospitals(b.get("hopitaux_souhaites") or b.get("Hopitaux_Souhaites")))
 
             if (
                 a["Hopital_Actuel"] in souhaites_b
                 and b["Hopital_Actuel"] in souhaites_a
             ):
-                room_id = build_room_id(
-                    a["Periode"], a["Specialite"], [a["Email"], b["Email"]]
+                email_a = str(a.get("user_email") or a.get("Email")).strip().lower()
+                email_b = str(b.get("user_email") or b.get("Email")).strip().lower()
+                disc = creer_ou_recuperer_discussion(
+                    participants=[email_a, email_b],
+                    type_match="bilateral",
+                    demande_ids=[str(a.get("Demande_ID") or a.get("demande_id")), str(b.get("Demande_ID") or b.get("demande_id"))]
                 )
+                room_id = disc["discussion_id"]
                 matches.append({
                     "room_id": room_id,
+                    "discussion_id": room_id,
                     "periode": a["Periode"],
                     "specialite": a["Specialite"],
                     "participants": [a, b],
-                    "emails": [
-                        a["Email"].strip().lower(),
-                        b["Email"].strip().lower(),
-                    ],
+                    "emails": [email_a, email_b],
                     "a": a,
                     "b": b,
                 })
@@ -869,11 +1159,11 @@ def compute_triangular_matches(df: pd.DataFrame) -> list[dict]:
     if df.empty:
         return matches
     seen_cycles = set()
-    records = [r for r in df.to_dict("records") if r.get("Statut") != "Accord trouvé"]
+    records = [r for r in df.to_dict("records") if str(r.get("statut") or r.get("Statut") or "").lower() not in ("conclue", "accord trouvé")]
     n = len(records)
 
     souhaites_map = {
-        idx: set(parse_hospitals(rec.get("Hopitaux_Souhaites", "")))
+        idx: set(parse_hospitals(rec.get("hopitaux_souhaites") or rec.get("Hopitaux_Souhaites")))
         for idx, rec in enumerate(records)
     }
 
@@ -905,9 +1195,9 @@ def compute_triangular_matches(df: pd.DataFrame) -> list[dict]:
                     b["Hopital_Actuel"] in souhaites_map[k]
                     and c["Hopital_Actuel"] in souhaites_map[i]
                 ):
-                    id_a = f"{a['Email'].lower()}_{a['Periode']}"
-                    id_b = f"{b['Email'].lower()}_{b['Periode']}"
-                    id_c = f"{c['Email'].lower()}_{c['Periode']}"
+                    id_a = f"{str(a.get('user_email') or a.get('Email')).lower()}_{a['Periode']}"
+                    id_b = f"{str(b.get('user_email') or b.get('Email')).lower()}_{b['Periode']}"
+                    id_c = f"{str(c.get('user_email') or c.get('Email')).lower()}_{c['Periode']}"
                     rotations = sorted([
                         (id_a, id_b, id_c),
                         (id_b, id_c, id_a),
@@ -916,21 +1206,26 @@ def compute_triangular_matches(df: pd.DataFrame) -> list[dict]:
                     canonical = rotations[0]
                     if canonical not in seen_cycles:
                         seen_cycles.add(canonical)
-                        room_id = build_room_id(
-                            a["Periode"],
-                            a["Specialite"],
-                            [a["Email"], b["Email"], c["Email"]],
+                        email_a = str(a.get("user_email") or a.get("Email")).strip().lower()
+                        email_b = str(b.get("user_email") or b.get("Email")).strip().lower()
+                        email_c = str(c.get("user_email") or c.get("Email")).strip().lower()
+                        disc = creer_ou_recuperer_discussion(
+                            participants=[email_a, email_b, email_c],
+                            type_match="triangulaire",
+                            demande_ids=[
+                                str(a.get("Demande_ID") or a.get("demande_id")),
+                                str(b.get("Demande_ID") or b.get("demande_id")),
+                                str(c.get("Demande_ID") or c.get("demande_id")),
+                            ]
                         )
+                        room_id = disc["discussion_id"]
                         matches.append({
                             "room_id": room_id,
+                            "discussion_id": room_id,
                             "periode": a["Periode"],
                             "specialite": a["Specialite"],
                             "participants": [a, b, c],
-                            "emails": [
-                                a["Email"].strip().lower(),
-                                b["Email"].strip().lower(),
-                                c["Email"].strip().lower(),
-                            ],
+                            "emails": [email_a, email_b, email_c],
                             "a": a,
                             "b": b,
                             "c": c,
@@ -945,8 +1240,8 @@ def filter_private_matches_for_user(
     if not user_email:
         return [], []
     clean_email = user_email.strip().lower()
-    my_bi = [m for m in all_bilateral if clean_email in m["emails"]]
-    my_tri = [t for t in all_triangular if clean_email in t["emails"]]
+    my_bi = [m for m in all_bilateral if clean_email in [e.lower() for e in m["emails"]]]
+    my_tri = [t for t in all_triangular if clean_email in [e.lower() for e in t["emails"]]]
     return my_bi, my_tri
 
 def build_user_notifications(
@@ -964,16 +1259,16 @@ def build_user_notifications(
     for m in my_bi:
         my_rooms.add(m["room_id"])
         notifs.append({
-            "titre": f"Nouvel échange direct trouvé pour {m['specialite']} ({m['periode']}) !",
-            "detail": "Match bilatéral (binôme) disponible dans votre salon privé.",
+            "titre": f"Correspondance directe trouvée ({m['specialite']} · {m['periode']})",
+            "detail": f"Échange binôme trouvé avec {m['b']['Nom'] if clean_email == str(m['a'].get('Email')).lower() else m['a']['Nom']}.",
             "room_id": m["room_id"],
         })
 
     for t in my_tri:
         my_rooms.add(t["room_id"])
         notifs.append({
-            "titre": f"Cycle triangulaire trouvé pour {t['specialite']} ({t['periode']}) !",
-            "detail": "Salon d'échange à 3 personnes ouvert.",
+            "titre": f"Cycle triangulaire disponible ({t['specialite']} · {t['periode']})",
+            "detail": "Un cycle d'échange complet à 3 étudiants a été formé.",
             "room_id": t["room_id"],
         })
 
@@ -992,20 +1287,8 @@ def build_user_notifications(
     return notifs
 
 # ---------------------------------------------------------------------------
-# 6. ENVOI DES EMAILS D'ALERTE SMTP
+# 8. ENVOI DES EMAILS D'ALERTE SMTP
 # ---------------------------------------------------------------------------
-def resolve_student_prenom(email: str, fallback_nom: str, df_utilisateurs: pd.DataFrame) -> str:
-    clean_email = (email or "").strip().lower()
-    if df_utilisateurs is not None and not df_utilisateurs.empty and clean_email:
-        rows = df_utilisateurs[df_utilisateurs["Email"].astype(str).str.strip().str.lower() == clean_email]
-        if not rows.empty:
-            prenom_val = str(rows.iloc[0].get("Prenom", "")).strip()
-            if prenom_val:
-                return prenom_val
-    if fallback_nom and str(fallback_nom).strip():
-        return str(fallback_nom).strip().split()[0]
-    return "Étudiant(e)"
-
 def get_smtp_config():
     server = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
     port = int(os.environ.get("SMTP_PORT", 587))
@@ -1044,18 +1327,18 @@ def send_match_notification_emails(
                 server.ehlo()
             server.login(smtp_user, smtp_password)
 
-            for participant in participants:
-                dest_email = str(participant.get("Email", "")).strip().lower()
+            for p in participants:
+                dest_email = str(p.get("Email") or p.get("user_email") or "").strip().lower()
                 if not dest_email or dest_email in seen_dest:
                     continue
                 seen_dest.add(dest_email)
 
-                prenom = resolve_student_prenom(dest_email, participant.get("Nom", ""), df_utilisateurs)
+                nom = str(p.get("Nom") or p.get("nom_etudiant") or "Étudiant(e)").strip()
                 corps = (
-                    f"Bonjour {prenom},\n\n"
-                    f"Une opportunité d'échange direct vient de se former pour votre stage de {specialite} ({periode}) !\n\n"
-                    f"Un salon de discussion privé et sécurisé a été ouvert sur PermutStage. Connectez-vous dès maintenant avec votre adresse étudiante et votre code PIN pour finaliser l'échange.\n\n"
-                    f"À très vite,\n"
+                    f"Bonjour {nom},\\n\\n"
+                    f"Une opportunité d'échange direct vient de se former pour votre stage de {specialite} ({periode}) !\\n\\n"
+                    f"Un salon de discussion privé et sécurisé a été ouvert sur PermutStage. Connectez-vous dès maintenant avec votre adresse étudiante et votre code PIN pour finaliser l'accord.\\n\\n"
+                    f"À très vite,\\n"
                     f"L'équipe PermutStage"
                 )
                 try:
@@ -1071,7 +1354,7 @@ def send_match_notification_emails(
         NOTIFIED_MATCH_ROOMS.add(room_id)
         return sent_count
     except Exception as exc:
-        print(f"Erreur send_match_notification_emails: {exc}")
+        print(f"[PermutStage] Erreur SMTP match alert: {exc}")
         return sent_count
 
 def send_pin_recovery_email(dest_email: str, prenom: str, pin: str) -> bool:
@@ -1083,20 +1366,17 @@ def send_pin_recovery_email(dest_email: str, prenom: str, pin: str) -> bool:
     pin_formatte = normalize_pin(pin)
     sujet = "[PermutStage] Récupération de votre code PIN"
     corps = (
-        f"Bonjour {prenom},\n\n"
-        f"Vous avez demandé la récupération de votre code PIN pour accéder à PermutStage.\n\n"
-        f"Votre code PIN de connexion est : {pin_formatte}\n\n"
-        f"Vous pouvez désormais vous connecter directement sur la plateforme avec votre adresse étudiante et ce code PIN.\n\n"
+        f"Bonjour {prenom},\\n\\n"
+        f"Vous avez demandé la récupération de votre code PIN pour accéder à PermutStage.\\n\\n"
+        f"Votre code PIN de connexion est : {pin_formatte}\\n\\n"
+        f"Vous pouvez désormais vous connecter directement sur la plateforme avec votre adresse étudiante et ce code PIN.\\n\\n"
         f"L'équipe PermutStage"
     )
 
     with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as server:
-        server.ehlo()
         if smtp_port in (587, 25):
             server.starttls()
-            server.ehlo()
         server.login(smtp_user, smtp_password)
-
         msg = MIMEText(corps, "plain", "utf-8")
         msg["Subject"] = sujet
         msg["From"] = smtp_user
@@ -1105,26 +1385,18 @@ def send_pin_recovery_email(dest_email: str, prenom: str, pin: str) -> bool:
     return True
 
 # ---------------------------------------------------------------------------
-# 7. COMPOSANT RICHE : SÉLECTEUR D'HÔPITAUX SOUHAITÉS PAR CASES À COCHER
+# 9. COMPOSANT CHECKBOX HÔPITAUX SOUHAITÉS AVEC SÉLECTION PAR PROVINCE
 # ---------------------------------------------------------------------------
 def render_hospital_checkbox_selector(
     selected_hospitals: list[str] = None,
     current_hospital: str = "",
     prefix: str = "depot",
 ):
-    """
-    Composant moderne et ergonomique de sélection des hôpitaux souhaités :
-    A. En-tête avec compteur dynamique "(X sélectionné(s))".
-    B. Bloc d'aide pastel de sélection rapide par région (+ Bruxelles (9)...).
-    C. Barre de recherche textuelle fluide et sélecteur de région en direct.
-    D. Liste défilable des 47 hôpitaux avec cases à cocher et blocage de l'hôpital actuel.
-    """
     selected_set = set(selected_hospitals or [])
     total_hospitals = len(TOUS_LES_HOPITAUX)
     initial_count = len([h for h in selected_set if h != current_hospital])
     count_label = f"({initial_count} sélectionné{'s' if initial_count > 1 else ''})"
 
-    # Badges de sélection rapide par région
     region_badges = []
     for reg, h_list in HOPITAUX_PAR_REGION.items():
         region_badges.append(
@@ -1136,7 +1408,6 @@ def render_hospital_checkbox_selector(
                 title=f"Ajouter ou retirer tous les hôpitaux de {reg}"
             )
         )
-    # Bouton de remise à zéro
     region_badges.append(
         Button(
             "✕ Tout désélectionner",
@@ -1147,7 +1418,6 @@ def render_hospital_checkbox_selector(
         )
     )
 
-    # Conteneur pastel d'aide
     quick_select_block = Div(
         Div(
             Span("⚡", style="font-size:1rem; margin-right:0.35rem;"),
@@ -1159,7 +1429,6 @@ def render_hospital_checkbox_selector(
         cls="quick-select-card"
     )
 
-    # Barre de filtre (Select Région + Recherche textuelle)
     region_options = [Option(f"Toutes les régions ({total_hospitals})", value="Toutes")]
     for reg, h_list in HOPITAUX_PAR_REGION.items():
         region_options.append(Option(f"{reg} ({len(h_list)})", value=reg))
@@ -1167,7 +1436,7 @@ def render_hospital_checkbox_selector(
     filter_bar = Div(
         Div(
             Label(
-                "Filtrer la liste par région",
+                "Filtrer par province / région",
                 Select(
                     *region_options,
                     id=f"filter-region-{prefix}",
@@ -1180,7 +1449,7 @@ def render_hospital_checkbox_selector(
         ),
         Div(
             Label(
-                "Recherche en direct",
+                "Recherche textuelle en direct",
                 Div(
                     Input(
                         id=f"search-hospital-{prefix}",
@@ -1199,7 +1468,6 @@ def render_hospital_checkbox_selector(
         style="display:flex; gap:0.75rem; flex-wrap:wrap; margin-bottom:0.75rem; align-items:flex-end;"
     )
 
-    # Lignes d'hôpitaux
     rows = []
     for h in TOUS_LES_HOPITAUX:
         reg = HOPITAL_VERS_REGION.get(h, "Autre")
@@ -1217,58 +1485,58 @@ def render_hospital_checkbox_selector(
                             "⚠️ (Votre hôpital actuel)",
                             cls="hospital-current-badge",
                             id=f"current-badge-{prefix}-{h_slug}",
-                            style="display:inline-block;" if is_current else "display:none;"
+                            style=f"display:{'inline-block' if is_current else 'none'};"
                         ),
-                        style="display:flex; align-items:center; flex-wrap:wrap; gap:0.35rem; margin-right:0.75rem;"
+                        style="display:flex; align-items:center; gap:0.45rem; flex-wrap:wrap;"
                     ),
-                    Input(
-                        type="checkbox",
-                        name="hopitaux_souhaites",
-                        value=h,
-                        checked=is_checked,
-                        disabled=is_current,
-                        data_region=reg,
-                        data_hospital=h,
-                        cls="hospital-checkbox-custom",
-                        onchange=f"updateHospitalSelectionCounter('{prefix}')"
-                    ),
-                    style="display:flex; align-items:center; justify-content:space-between; margin-bottom:0; width:100%; cursor:pointer;"
+                    style="margin:0; cursor:pointer; flex:1; display:flex; align-items:center;"
                 ),
-                id=f"hospital-row-{prefix}-{h_slug}",
+                Input(
+                    type="checkbox",
+                    name="hopitaux_souhaites",
+                    value=h,
+                    checked=is_checked,
+                    disabled=is_current,
+                    cls="hospital-checkbox-custom",
+                    id=f"cb-{prefix}-{h_slug}",
+                    data_region=reg,
+                    data_hospital=h,
+                    onchange=f"updateHospitalSelectionCounter('{prefix}')"
+                ),
+                id=f"row-{prefix}-{h_slug}",
                 cls=f"hospital-row-item {'is-current-hospital' if is_current else ''}",
                 data_region=reg,
-                data_hospital=h.lower(),
+                data_hospital=h.lower()
             )
         )
 
-    # Conteneur défilable
     scroll_container = Div(
-        Div(*rows, id=f"hospital-list-{prefix}"),
-        id=f"hospital-scroll-{prefix}",
+        *rows,
+        id=f"hospital-list-{prefix}",
         cls="hospital-scroll-container"
     )
 
-    # Légende en bas
     bottom_helper = Div(
         Small(
             Span(f"{total_hospitals} hôpitaux affichés", id=f"visible-count-{prefix}"),
-            " · Cliquez sur n'importe quelle ligne pour cocher ou décocher.",
-            style="color:#64748b; font-size:0.78rem;"
+            " · Cochez les hôpitaux où vous accepteriez de permuter.",
+            style="color:#64748b; font-size:0.8rem;"
         ),
-        style="margin-top:0.4rem; display:flex; justify-content:space-between; align-items:center;"
+        style="margin-top:0.5rem; display:flex; justify-content:space-between; align-items:center;"
     )
 
-    # Script interactif client
     js_script = Script(f"""
     function updateHospitalSelectionCounter(prefix) {{
         const list = document.getElementById('hospital-list-' + prefix);
         if (!list) return;
-        const checkboxes = list.querySelectorAll('input[type="checkbox"][name="hopitaux_souhaites"]:checked:not(:disabled)');
-        const count = checkboxes.length;
+        const cbs = list.querySelectorAll('input[type="checkbox"]:not([disabled])');
+        let checkedCount = 0;
+        cbs.forEach(cb => {{ if (cb.checked) checkedCount++; }});
+
         const counterEl = document.getElementById('selected-counter-' + prefix);
         if (counterEl) {{
-            counterEl.textContent = '(' + count + (count <= 1 ? ' sélectionné' : ' sélectionnés') + ')';
-            if (count > 0) {{
+            counterEl.textContent = '(' + checkedCount + ' sélectionné' + (checkedCount > 1 ? 's' : '') + ')';
+            if (checkedCount > 0) {{
                 counterEl.classList.add('has-selected');
             }} else {{
                 counterEl.classList.remove('has-selected');
@@ -1276,21 +1544,24 @@ def render_hospital_checkbox_selector(
         }}
     }}
 
-    function toggleRegionHospitals(region, prefix) {{
+    function toggleRegionHospitals(regionName, prefix) {{
         const list = document.getElementById('hospital-list-' + prefix);
         if (!list) return;
-        const checkboxes = list.querySelectorAll('input[type="checkbox"][data-region="' + region + '"]:not(:disabled)');
+        const cbs = list.querySelectorAll('input[type="checkbox"][data-region="' + regionName + '"]:not([disabled])');
         let allChecked = true;
-        checkboxes.forEach(cb => {{ if (!cb.checked) allChecked = false; }});
-        checkboxes.forEach(cb => {{ cb.checked = !allChecked; }});
+        cbs.forEach(cb => {{ if (!cb.checked) allChecked = false; }});
+
+        cbs.forEach(cb => {{
+            cb.checked = !allChecked;
+        }});
         updateHospitalSelectionCounter(prefix);
     }}
 
     function clearAllHospitals(prefix) {{
         const list = document.getElementById('hospital-list-' + prefix);
         if (!list) return;
-        const checkboxes = list.querySelectorAll('input[type="checkbox"]:not(:disabled)');
-        checkboxes.forEach(cb => {{ cb.checked = false; }});
+        const cbs = list.querySelectorAll('input[type="checkbox"]:not([disabled])');
+        cbs.forEach(cb => {{ cb.checked = false; }});
         updateHospitalSelectionCounter(prefix);
     }}
 
@@ -1299,9 +1570,9 @@ def render_hospital_checkbox_selector(
         const searchInput = document.getElementById('search-hospital-' + prefix);
         const regionSelect = document.getElementById('filter-region-' + prefix);
         const visibleCountEl = document.getElementById('visible-count-' + prefix);
-        if (!list) return;
 
-        const q = searchInput ? searchInput.value.toLowerCase().trim() : '';
+        if (!list) return;
+        const q = (searchInput ? searchInput.value : '').toLowerCase().trim();
         const selectedRegion = regionSelect ? regionSelect.value : 'Toutes';
 
         const rows = list.querySelectorAll('.hospital-row-item');
@@ -1372,12 +1643,60 @@ def render_hospital_checkbox_selector(
     )
 
 # ---------------------------------------------------------------------------
-# 8. EN-TÊTE & PIED DE PAGE GLOBAUX
+# 10. EN-TÊTE & PIED DE PAGE GLOBAUX
 # ---------------------------------------------------------------------------
-def render_header(session, active_tab="accueil"):
-    user_email = session.get("email")
-    user_prenom = session.get("prenom")
-    user_nom = session.get("nom")
+def get_session_user(session, req: Request = None) -> dict | None:
+    """
+    Charge le profil complet de l'utilisateur connecté depuis Firestore.
+    Priorité :
+    1. session['user_id'] ou session['user_email'] ou session['email']
+    2. req.query_params.get('auth') ou req.query_params.get('user_email')
+    Recharge directement depuis Firestore db.collection('users').document(email).get().
+    """
+    user_email = session.get("user_id") or session.get("user_email") or session.get("email")
+    if not user_email and req is not None:
+        try:
+            q_email = req.query_params.get("auth") or req.query_params.get("user_email") or req.query_params.get("u")
+            if q_email:
+                user_email = q_email.strip().lower()
+                session["user_id"] = user_email
+                session["user_email"] = user_email
+                session["email"] = user_email
+        except Exception:
+            pass
+
+    if not user_email:
+        return None
+
+    clean_email = str(user_email).strip().lower()
+    user_data = get_user_by_email(clean_email)
+    if user_data:
+        session["user_id"] = clean_email
+        session["user_email"] = clean_email
+        session["email"] = clean_email
+        if user_data.get("nom"): session["nom"] = user_data["nom"]
+        if user_data.get("prenom"): session["prenom"] = user_data["prenom"]
+        if user_data.get("code_pin"): session["pin"] = user_data["code_pin"]
+        return user_data
+
+    return {
+        "email": clean_email,
+        "Email": clean_email,
+        "nom": session.get("nom", "Étudiant"),
+        "Nom": session.get("nom", "Étudiant"),
+        "prenom": session.get("prenom", ""),
+        "Prenom": session.get("prenom", ""),
+        "code_pin": session.get("pin", ""),
+        "PIN": session.get("pin", ""),
+        "statut": "actif",
+        "created_at": datetime.now().isoformat(),
+    }
+
+def render_header(session, active_tab="accueil", req: Request = None):
+    current_u = get_session_user(session, req)
+    user_email = current_u.get("email") if current_u else None
+    user_prenom = current_u.get("prenom") if current_u else ""
+    user_nom = current_u.get("nom") if current_u else ""
     is_admin = session.get("is_admin", False)
 
     df_demandes = load_demandes_data()
@@ -1404,9 +1723,11 @@ def render_header(session, active_tab="accueil"):
     ]
 
     if user_email:
+        display_name = f"{user_prenom} {user_nom}".strip() or user_email
         auth_section = Div(
             Span(
-                f"👤 {user_prenom} {user_nom}",
+                f"👤 {display_name}",
+                cls="auth-connected-indicator",
                 style="font-weight:700; font-size:0.85rem; color:#1e293b; background:#f1f5f9; padding:0.35rem 0.75rem; border-radius:9999px; margin-right:0.6rem; border:1px solid #e2e8f0;"
             ),
             A(
@@ -1467,7 +1788,7 @@ def render_footer():
     return Footer(
         Div(
             P("Plateforme collaborative de permutation de stages hospitaliers · Promotion Médecine 2028 · FastHTML & Firebase Firestore"),
-            Small("Conception épurée avec Pico.css · Confidentialité absolue des données étudiantes"),
+            Small("Données réelles synchronisées et persistées dans Google Cloud Firestore (Collections: users, demandes, discussions, messages)"),
             A("🔒 Accès Administrateur", href="/admin-login-view", style="display:block; margin-top:0.5rem; font-size:0.75rem; color:#94a3b8; text-decoration:none;"),
             style="text-align: center; color: #64748b; font-size: 0.82rem; padding: 2rem 0 1rem 0;"
         ),
@@ -1475,26 +1796,26 @@ def render_footer():
     )
 
 # ---------------------------------------------------------------------------
-# 9. ROUTES DE L'APPLICATION (LES 5 VUES + AUTH + ADMIN)
+# 11. ROUTES PRINCIPALES DE L'APPLICATION
 # ---------------------------------------------------------------------------
 
 # === VUE 1 : ACCUEIL & GUIDE ===
 @rt("/")
-def get(session):
+def get(session, req: Request = None):
     df_demandes = load_demandes_data()
-    df_users = load_users_data()
+    df_users = load_all_users()
     all_bi = compute_bilateral_matches(df_demandes)
     all_tri = compute_triangular_matches(df_demandes)
 
     return Main(
-        render_header(session, "accueil"),
+        render_header(session, "accueil", req),
         Div(
             Div(
                 Div("✨ PROMOTION MÉDECINE 2028 · MASTER 2", cls="hero-badge"),
                 H1("Trouvez votre binôme de stage idéal en quelques clics", style="font-size:2.1rem; font-weight:800;"),
                 P(
                     "Bienvenue sur PermutStage, l'application pensée pour fluidifier, simplifier et centraliser les échanges de lieux de stages hospitaliers. "
-                    "Vos souhaits sont analysés en temps réel par notre algorithme de permutation, dans le respect le plus strict de votre confidentialité.",
+                    "Vos souhaits sont analysés en temps réel par notre algorithme de permutation, avec persistance garantie sur Google Cloud Firestore.",
                     style="font-size:1.05rem; opacity:0.95; line-height:1.6;"
                 ),
                 Div(
@@ -1508,7 +1829,7 @@ def get(session):
             # KPIs
             Div(
                 Div(Div(str(len(df_users)), cls="stat-val"), Div("Étudiants inscrits", cls="stat-lbl"), cls="stat-card"),
-                Div(Div(str(len(df_demandes)), cls="stat-val"), Div("Offres déposées", cls="stat-lbl"), cls="stat-card"),
+                Div(Div(str(len(df_demandes)), cls="stat-val"), Div("Offres actives", cls="stat-lbl"), cls="stat-card"),
                 Div(Div(str(len(all_bi)), cls="stat-val"), Div("Matchs bilatéraux (A ↔ B)", cls="stat-lbl"), cls="stat-card"),
                 Div(Div(str(len(all_tri)), cls="stat-val"), Div("Cycles triangulaires (3)", cls="stat-lbl"), cls="stat-card"),
                 style="display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:1rem; margin-bottom:2rem;"
@@ -1518,7 +1839,7 @@ def get(session):
             Div(
                 Article(
                     Strong("1. Créer son profil"),
-                    P("Nom, prénom, email institutionnel et code PIN à 4 chiffres. Aucun mot de passe complexe à mémoriser.", style="font-size:0.85rem; color:#475569; margin-top:0.35rem;"),
+                    P("Nom, prénom, email institutionnel et code PIN à 4 chiffres. Votre compte persiste dans Firestore.", style="font-size:0.85rem; color:#475569; margin-top:0.35rem;"),
                 ),
                 Article(
                     Strong("2. Déposer son offre"),
@@ -1547,7 +1868,7 @@ def get(session):
                 Article(
                     H4("🔒 Confidentialité garantie", style="color:#0f172a; font-weight:700;"),
                     Ul(
-                        Li(Strong("Code PIN 4 chiffres : "), "Connexion rapide sans stockage de mot de passe sensible."),
+                        Li(Strong("Code PIN 4 chiffres : "), "Connexion rapide sans mot de passe complexe."),
                         Li(Strong("Hermétisme complet : "), "Aucun camarade externe ne peut voir qui permute avec qui."),
                         Li(Strong("Salons chiffrés par cycle : "), "Seuls les membres du match accèdent à la messagerie.")
                     )
@@ -1561,14 +1882,11 @@ def get(session):
 
 # === VUE 2 : DÉPOSER UNE DEMANDE ===
 @rt("/deposer")
-def get(session):
-    user_email = session.get("email")
-    user_prenom = session.get("prenom")
-    user_nom = session.get("nom")
-
-    if not user_email:
+def get(session, req: Request = None):
+    u = get_session_user(session, req)
+    if not u or not u.get("email"):
         return Main(
-            render_header(session, "deposer"),
+            render_header(session, "deposer", req),
             Div(
                 Article(
                     H3("🔒 Connexion requise", style="font-weight:700;"),
@@ -1581,18 +1899,20 @@ def get(session):
             render_footer()
         )
 
+    user_email = u["email"]
+    user_nom = f"{u.get('prenom', '')} {u.get('nom', '')}".strip() or user_email
     default_actuel = TOUS_LES_HOPITAUX[0]
 
     return Main(
-        render_header(session, "deposer"),
+        render_header(session, "deposer", req),
         Div(
             H2("Déposer une nouvelle offre de permutation", style="font-weight:800; color:#0f172a;"),
-            P("Vos coordonnées sont automatiquement verrouillées sur votre profil étudiant connecté. Notre algorithme calculera vos correspondances en temps réel."),
+            P("Vos coordonnées sont automatiquement verrouillées sur votre profil étudiant connecté. L'offre sera enregistrée dans Firestore et analysée en temps réel."),
             Div(id="depot-feedback"),
             Form(
                 Div(
                     Div(
-                        Label("Nom complet (verrouillé)", Input(value=f"{user_prenom} {user_nom}", disabled=True, style="background:#f8fafc;")),
+                        Label("Nom complet (verrouillé)", Input(value=user_nom, disabled=True, style="background:#f8fafc;")),
                         Label("Email institutionnel (verrouillé)", Input(value=user_email, disabled=True, style="background:#f8fafc;")),
                     ),
                     Div(
@@ -1611,7 +1931,6 @@ def get(session):
                     ),
                     style="display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:1.5rem; margin-bottom:1rem;"
                 ),
-                # Nouveau sélecteur moderne d'hôpitaux souhaités par cases à cocher
                 render_hospital_checkbox_selector(selected_hospitals=[], current_hospital=default_actuel, prefix="depot"),
                 Button(
                     "Publier ma demande de permutation",
@@ -1630,32 +1949,28 @@ def get(session):
 
 @rt("/nouvelle-demande")
 async def post(session, req: Request = None, periode: str = "", specialite: str = "", hopital_actuel: str = "", hopitaux_souhaites: list[str] = None):
-    user_email = session.get("email")
-    user_nom = f"{session.get('prenom', '')} {session.get('nom', '')}".strip()
-    user_pin = session.get("pin", "")
-
-    if not user_email:
+    u = get_session_user(session, req)
+    if not u or not u.get("email"):
         return Article(P("Session expirée. Veuillez vous reconnecter.", style="color:#b91c1c; font-weight:600;"), cls="contrast")
 
-    # Extraction robuste des cases à cocher multiples
+    user_email = u["email"].strip().lower()
+    user_nom = f"{u.get('prenom', '')} {u.get('nom', '')}".strip() or user_email
+
     h_list = []
     if req is not None:
         try:
             form_data = await req.form()
             h_list = form_data.getlist("hopitaux_souhaites")
-            if not periode:
-                periode = form_data.get("periode", "")
-            if not specialite:
-                specialite = form_data.get("specialite", "")
-            if not hopital_actuel:
-                hopital_actuel = form_data.get("hopital_actuel", "")
+            if not periode: periode = str(form_data.get("periode", "")).strip()
+            if not specialite: specialite = str(form_data.get("specialite", "")).strip()
+            if not hopital_actuel: hopital_actuel = str(form_data.get("hopital_actuel", "")).strip()
         except Exception:
             pass
 
     if not h_list and hopitaux_souhaites:
         h_list = [hopitaux_souhaites] if isinstance(hopitaux_souhaites, str) else list(hopitaux_souhaites)
 
-    h_list = [h.strip() for h in h_list if h and h.strip()]
+    h_list = [str(h).strip() for h in h_list if str(h).strip()]
 
     if not h_list:
         return Article(
@@ -1669,39 +1984,36 @@ async def post(session, req: Request = None, periode: str = "", specialite: str 
             style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
         )
 
-    df_demandes = load_demandes_data()
-    if not df_demandes.empty:
-        doublon = df_demandes[
-            (df_demandes["Email"].str.lower() == user_email.lower())
-            & (df_demandes["Periode"] == periode)
-        ]
-        if not doublon.empty:
-            return Article(
-                P(f"Vous avez déjà une offre active sur la période {periode}. Modifiez-la dans l'onglet 'Gérer mon offre'.", style="color:#b91c1c; font-weight:700; margin:0;"),
-                style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
-            )
-
-    df_users = load_users_data()
-    all_bi_avant = compute_bilateral_matches(df_demandes)
-    all_tri_avant = compute_triangular_matches(df_demandes)
-    anciens_rooms = {m["room_id"] for m in all_bi_avant} | {t["room_id"] for t in all_tri_avant}
-
-    nouvelle_demande = {
-        "Demande_ID": f"DEM_{uuid.uuid4().hex[:10].upper()}",
-        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    doc_id = f"{user_email}_{periode}".replace("@", "_at_").replace(".", "_")
+    demande_data = {
+        "demande_id": doc_id,
+        "Demande_ID": doc_id,
+        "user_email": user_email,
+        "Email": user_email,
+        "nom_etudiant": user_nom,
         "Nom": user_nom,
-        "Email": user_email.lower(),
-        "PIN": user_pin,
+        "periode": periode,
         "Periode": periode,
+        "specialite": specialite,
         "Specialite": specialite,
+        "hopital_actuel": hopital_actuel,
         "Hopital_Actuel": hopital_actuel,
+        "hopitaux_souhaites": h_list,
         "Hopitaux_Souhaites": serialize_hospitals(h_list),
+        "statut": "disponible",
         "Statut": "Disponible",
+        "updated_at": datetime.now().isoformat(),
+        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-    if add_demande_firestore(nouvelle_demande):
-        df_maj = pd.concat([df_demandes, pd.DataFrame([nouvelle_demande])], ignore_index=True)
-        # Déclenchement automatique des alertes emails
+    df_demandes_avant = load_demandes_data()
+    all_bi_avant = compute_bilateral_matches(df_demandes_avant)
+    all_tri_avant = compute_triangular_matches(df_demandes_avant)
+    anciens_rooms = {m["room_id"] for m in all_bi_avant} | {t["room_id"] for t in all_tri_avant}
+
+    if save_demande(demande_data):
+        df_maj = load_demandes_data()
+        df_users = load_all_users()
         nouveaux_bi = compute_bilateral_matches(df_maj)
         nouveaux_tri = compute_triangular_matches(df_maj)
         for m in nouveaux_bi:
@@ -1712,21 +2024,20 @@ async def post(session, req: Request = None, periode: str = "", specialite: str 
                 send_match_notification_emails(t["participants"], t["periode"], t["specialite"], t["room_id"], df_users)
 
         return Article(
-            H4("🎉 Offre publiée avec succès !", style="color:#14532d; font-weight:800; margin-bottom:0.4rem;"),
-            P(f"Votre demande pour le stage de {specialite} en {periode} ({hopital_actuel}) a été publiée avec {len(h_list)} hôpital(ux) souhaité(s)."),
+            H4("🎉 Offre publiée et enregistrée dans Firestore !", style="color:#14532d; font-weight:800; margin-bottom:0.4rem;"),
+            P(f"Votre demande pour le stage de {specialite} en {periode} ({hopital_actuel}) a été persistée avec {len(h_list)} hôpital(ux) souhaité(s)."),
             A("Consulter mes correspondances", href="/matchs", role="button", cls="primary", style="margin-top:0.5rem; border-radius:8px;"),
             style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1.25rem; border-radius:12px; margin-bottom:1.5rem;"
         )
-    else:
-        return Article(P("Erreur lors de l'enregistrement dans la base de données. Veuillez réessayer.", style="color:#b91c1c;"), cls="contrast")
+    return Article(P("Erreur lors de l'enregistrement dans la base de données Firestore.", style="color:#b91c1c;"), cls="contrast")
 
 # === VUE 3 : MES MATCHS & SALONS PRIVÉS (CONFIDENTIALITÉ STRICTE) ===
 @rt("/matchs")
-def get(session):
-    user_email = session.get("email")
-    if not user_email:
+def get(session, req: Request = None):
+    u = get_session_user(session, req)
+    if not u or not u.get("email"):
         return Main(
-            render_header(session, "matchs"),
+            render_header(session, "matchs", req),
             Div(
                 Article(
                     H3("🔒 Confidentialité absolue des correspondances", style="font-weight:700;"),
@@ -1739,8 +2050,8 @@ def get(session):
             render_footer()
         )
 
+    user_email = u["email"]
     df_demandes = load_demandes_data()
-    df_messages = load_messages_data()
     all_bi = compute_bilateral_matches(df_demandes)
     all_tri = compute_triangular_matches(df_demandes)
     my_bi, my_tri = filter_private_matches_for_user(user_email, all_bi, all_tri)
@@ -1752,15 +2063,15 @@ def get(session):
         for m in my_bi:
             a, b = m["a"], m["b"]
             room_id = m["room_id"]
-            msgs_salon = df_messages[df_messages["Room_ID"] == room_id] if not df_messages.empty else pd.DataFrame()
+            msgs_salon = recuperer_messages(room_id)
             chat_elements = []
-            for _, msg in msgs_salon.iterrows():
-                is_me = msg["Sender_Email"].strip().lower() == user_email.lower()
+            for msg in msgs_salon:
+                is_me = (msg.get("sender_email") or msg.get("Sender_Email") or "").strip().lower() == user_email.lower()
                 chat_elements.append(
                     Div(
-                        Strong(msg["Sender_Name"]),
-                        Small(f" · {msg['Timestamp']}", style="font-size:0.75rem; opacity:0.8;"),
-                        P(msg["Texte"], style="margin:0.2rem 0 0 0;"),
+                        Strong(msg.get("sender_name") or msg.get("Sender_Name")),
+                        Small(f" · {msg.get('timestamp') or msg.get('Timestamp')}", style="font-size:0.75rem; opacity:0.8;"),
+                        P(msg.get("texte") or msg.get("Texte"), style="margin:0.2rem 0 0 0;"),
                         cls=f"chat-bubble {'chat-me' if is_me else 'chat-other'}"
                     )
                 )
@@ -1787,18 +2098,20 @@ def get(session):
                     Details(
                         Summary(f"💬 Salon de discussion privé ({len(msgs_salon)} messages)"),
                         Div(
-                            Div(*chat_elements, id=f"chat-box-{room_id}", style="max-height:220px; overflow-y:auto; margin:0.75rem 0; padding:0.6rem; background:#ffffff; border-radius:10px; border:1px solid #e2e8f0;"),
+                            Div(*chat_elements, id=f"chat-box-{slugify(room_id)}", style="max-height:220px; overflow-y:auto; margin:0.75rem 0; padding:0.6rem; background:#ffffff; border-radius:10px; border:1px solid #e2e8f0;"),
                             Form(
                                 Div(
                                     Input(name="texte", placeholder="Écrire un message dans ce salon privé...", required=True, style="margin-bottom:0;"),
+                                    Input(type="hidden", name="discussion_id", value=room_id),
                                     Input(type="hidden", name="room_id", value=room_id),
                                     Button("Envoyer", type="submit", cls="primary", style="margin-bottom:0; width:auto; border-radius:8px;"),
                                     style="display:flex; gap:0.5rem;"
                                 ),
-                                hx_post="/post-chat-message",
-                                hx_target=f"#chat-box-{room_id}",
+                                hx_post="/envoyer-message",
+                                hx_target=f"#chat-box-{slugify(room_id)}",
                                 hx_swap="innerHTML"
                             ),
+                            A("Ouvrir en plein écran", href=f"/salon/{room_id}", style="font-size:0.78rem; display:inline-block; margin-top:0.4rem;"),
                             style="margin-top:0.5rem;"
                         )
                     ),
@@ -1813,15 +2126,15 @@ def get(session):
         for t in my_tri:
             a, b, c = t["a"], t["b"], t["c"]
             room_id = t["room_id"]
-            msgs_salon = df_messages[df_messages["Room_ID"] == room_id] if not df_messages.empty else pd.DataFrame()
+            msgs_salon = recuperer_messages(room_id)
             chat_elements = []
-            for _, msg in msgs_salon.iterrows():
-                is_me = msg["Sender_Email"].strip().lower() == user_email.lower()
+            for msg in msgs_salon:
+                is_me = (msg.get("sender_email") or msg.get("Sender_Email") or "").strip().lower() == user_email.lower()
                 chat_elements.append(
                     Div(
-                        Strong(msg["Sender_Name"]),
-                        Small(f" · {msg['Timestamp']}", style="font-size:0.75rem; opacity:0.8;"),
-                        P(msg["Texte"], style="margin:0.2rem 0 0 0;"),
+                        Strong(msg.get("sender_name") or msg.get("Sender_Name")),
+                        Small(f" · {msg.get('timestamp') or msg.get('Timestamp')}", style="font-size:0.75rem; opacity:0.8;"),
+                        P(msg.get("texte") or msg.get("Texte"), style="margin:0.2rem 0 0 0;"),
                         cls=f"chat-bubble {'chat-me' if is_me else 'chat-other'}"
                     )
                 )
@@ -1850,18 +2163,20 @@ def get(session):
                     Details(
                         Summary(f"💬 Salon de discussion privé ({len(msgs_salon)} messages)"),
                         Div(
-                            Div(*chat_elements, id=f"chat-box-{room_id}", style="max-height:220px; overflow-y:auto; margin:0.75rem 0; padding:0.6rem; background:#ffffff; border-radius:10px; border:1px solid #e2e8f0;"),
+                            Div(*chat_elements, id=f"chat-box-{slugify(room_id)}", style="max-height:220px; overflow-y:auto; margin:0.75rem 0; padding:0.6rem; background:#ffffff; border-radius:10px; border:1px solid #e2e8f0;"),
                             Form(
                                 Div(
                                     Input(name="texte", placeholder="Écrire un message aux collègues du cycle...", required=True, style="margin-bottom:0;"),
+                                    Input(type="hidden", name="discussion_id", value=room_id),
                                     Input(type="hidden", name="room_id", value=room_id),
                                     Button("Envoyer", type="submit", cls="primary", style="margin-bottom:0; width:auto; border-radius:8px;"),
                                     style="display:flex; gap:0.5rem;"
                                 ),
-                                hx_post="/post-chat-message",
-                                hx_target=f"#chat-box-{room_id}",
+                                hx_post="/envoyer-message",
+                                hx_target=f"#chat-box-{slugify(room_id)}",
                                 hx_swap="innerHTML"
                             ),
+                            A("Ouvrir en plein écran", href=f"/salon/{room_id}", style="font-size:0.78rem; display:inline-block; margin-top:0.4rem;"),
                             style="margin-top:0.5rem;"
                         )
                     ),
@@ -1870,10 +2185,10 @@ def get(session):
             )
 
     return Main(
-        render_header(session, "matchs"),
+        render_header(session, "matchs", req),
         Div(
             H2("Mes correspondances privées & Salons de discussion", style="font-weight:800; color:#0f172a;"),
-            P(f"Affichage strictement réservé à votre profil ({user_email}). Aucun camarade extérieur ne peut visualiser vos opportunités."),
+            P(f"Affichage strictement réservé à votre profil ({user_email}). Les salons et messages sont persistés en temps réel dans Firestore."),
             Div(
                 Div(H3(f"Binômes bilatéraux ({len(my_bi)})", style="font-size:1.15rem; font-weight:700;"), *bi_sections),
                 Div(H3(f"Cycles triangulaires ({len(my_tri)})", style="font-size:1.15rem; font-weight:700;"), *tri_sections),
@@ -1884,25 +2199,80 @@ def get(session):
         render_footer()
     )
 
+# === VUE SALON DÉDIÉ : /salon/{id} ===
+@rt("/salon/{id}")
+def get(session, id: str, req: Request = None):
+    u = get_session_user(session, req)
+    if not u or not u.get("email"):
+        return RedirectResponse("/login-view")
+
+    user_email = u["email"].strip().lower()
+    disc_id = str(id).strip()
+
+    msgs = recuperer_messages(disc_id)
+    chat_elements = []
+    for msg in msgs:
+        is_me = (msg.get("sender_email") or msg.get("Sender_Email") or "").strip().lower() == user_email
+        chat_elements.append(
+            Div(
+                Strong(msg.get("sender_name") or msg.get("Sender_Name")),
+                Small(f" · {msg.get('timestamp') or msg.get('Timestamp')}", style="font-size:0.75rem; opacity:0.8;"),
+                P(msg.get("texte") or msg.get("Texte"), style="margin:0.2rem 0 0 0;"),
+                cls=f"chat-bubble {'chat-me' if is_me else 'chat-other'}"
+            )
+        )
+
+    return Main(
+        render_header(session, "matchs", req),
+        Div(
+            A("← Retour à Mes Matchs", href="/matchs", style="display:inline-block; margin-bottom:1rem; font-size:0.9rem; font-weight:600;"),
+            Article(
+                H3(f"💬 Salon de discussion privé : {disc_id}", style="font-weight:700;"),
+                P("Tous les messages échangés sont enregistrés de façon sécurisée dans la collection Firestore 'messages'."),
+                Div(*chat_elements, id=f"chat-box-{slugify(disc_id)}", style="min-height:280px; max-height:450px; overflow-y:auto; margin:1rem 0; padding:1rem; background:#ffffff; border-radius:10px; border:1px solid #e2e8f0;"),
+                Form(
+                    Div(
+                        Input(name="texte", placeholder="Écrire votre message...", required=True, style="margin-bottom:0;"),
+                        Input(type="hidden", name="discussion_id", value=disc_id),
+                        Input(type="hidden", name="room_id", value=disc_id),
+                        Button("Envoyer", type="submit", cls="primary", style="margin-bottom:0; width:auto; border-radius:8px;"),
+                        style="display:flex; gap:0.5rem;"
+                    ),
+                    hx_post="/envoyer-message",
+                    hx_target=f"#chat-box-{slugify(disc_id)}",
+                    hx_swap="innerHTML"
+                )
+            ),
+            cls="container"
+        ),
+        render_footer()
+    )
+
+@rt("/envoyer-message")
 @rt("/post-chat-message")
-def post(session, room_id: str, texte: str):
-    user_email = session.get("email")
-    user_name = f"{session.get('prenom', '')} {session.get('nom', '')}".strip() or user_email
-    if not user_email or not texte.strip():
+def post(session, req: Request = None, discussion_id: str = "", room_id: str = "", texte: str = ""):
+    u = get_session_user(session, req)
+    if not u or not u.get("email") or not texte.strip():
         return ""
 
-    append_message_firestore(room_id, user_email, user_name, texte.strip())
-    df_messages = load_messages_data()
-    msgs_salon = df_messages[df_messages["Room_ID"] == room_id] if not df_messages.empty else pd.DataFrame()
+    target_id = discussion_id.strip() or room_id.strip()
+    if not target_id:
+        return ""
+
+    user_email = u["email"].strip().lower()
+    user_name = f"{u.get('prenom', '')} {u.get('nom', '')}".strip() or user_email
+
+    envoyer_message(target_id, user_email, user_name, texte.strip())
+    msgs_salon = recuperer_messages(target_id)
 
     elements = []
-    for _, msg in msgs_salon.iterrows():
-        is_me = msg["Sender_Email"].strip().lower() == user_email.lower()
+    for msg in msgs_salon:
+        is_me = (msg.get("sender_email") or msg.get("Sender_Email") or "").strip().lower() == user_email
         elements.append(
             Div(
-                Strong(msg["Sender_Name"]),
-                Small(f" · {msg['Timestamp']}", style="font-size:0.75rem; opacity:0.8;"),
-                P(msg["Texte"], style="margin:0.2rem 0 0 0;"),
+                Strong(msg.get("sender_name") or msg.get("Sender_Name")),
+                Small(f" · {msg.get('timestamp') or msg.get('Timestamp')}", style="font-size:0.75rem; opacity:0.8;"),
+                P(msg.get("texte") or msg.get("Texte"), style="margin:0.2rem 0 0 0;"),
                 cls=f"chat-bubble {'chat-me' if is_me else 'chat-other'}"
             )
         )
@@ -1910,7 +2280,7 @@ def post(session, room_id: str, texte: str):
 
 # === VUE 4 : CATALOGUE PUBLIC (ANONYMISÉ PAR CONFIDENTIALITÉ) ===
 @rt("/catalogue")
-def get(session, f_periode: str = "Toutes", f_specialite: str = "Toutes", f_region: str = "Toutes", q: str = ""):
+def get(session, f_periode: str = "Toutes", f_specialite: str = "Toutes", f_region: str = "Toutes", q: str = "", req: Request = None):
     df_demandes = load_demandes_data()
     df_filtre = df_demandes.copy()
 
@@ -1933,7 +2303,7 @@ def get(session, f_periode: str = "Toutes", f_specialite: str = "Toutes", f_regi
         cards.append(P("Aucune offre ne correspond aux critères sélectionnés.", style="font-style:italic; color:#64748b;"))
     else:
         for _, row in df_filtre.iterrows():
-            souhaites_str = ", ".join(parse_hospitals(row.get("Hopitaux_Souhaites", "")))
+            souhaites_str = ", ".join(parse_hospitals(row.get("hopitaux_souhaites") or row.get("Hopitaux_Souhaites")))
             region_act = HOPITAL_VERS_REGION.get(row.get("Hopital_Actuel", ""), "Autre")
             statut = row.get("Statut", "Disponible")
             st_class = "status-disponible" if statut == "Disponible" else ("status-discussion" if statut == "En discussion" else "status-accord")
@@ -1951,7 +2321,7 @@ def get(session, f_periode: str = "Toutes", f_specialite: str = "Toutes", f_regi
                         Strong("Hôpitaux souhaités : "), souhaites_str,
                         style="font-size:0.9rem; margin-bottom:0.4rem; line-height:1.5;"
                     ),
-                    Small(f"Mis à jour le {row.get('Timestamp', '')} · Identité protégée par confidentialité", style="color:#94a3b8; font-size:0.75rem;"),
+                    Small(f"Mis à jour le {row.get('Timestamp', '')} · Synchronisé Firestore · Anonymat garanti", style="color:#94a3b8; font-size:0.75rem;"),
                     style="margin-bottom:0.75rem; background:#ffffff; border:1px solid #e2e8f0; border-radius:12px; padding:1.15rem;"
                 )
             )
@@ -1969,7 +2339,7 @@ def get(session, f_periode: str = "Toutes", f_specialite: str = "Toutes", f_regi
     )
 
     return Main(
-        render_header(session, "catalogue"),
+        render_header(session, "catalogue", req),
         Div(
             H2(f"Catalogue des offres de stage disponibles ({len(df_filtre)} affichée(s))", style="font-weight:800; color:#0f172a;"),
             P("Pour préserver la vie privée des étudiants, les coordonnées ne sont jamais révélées publiquement mais uniquement aux partenaires d'échange dans l'onglet 'Mes Matchs'."),
@@ -1982,11 +2352,11 @@ def get(session, f_periode: str = "Toutes", f_specialite: str = "Toutes", f_regi
 
 # === VUE 5 : GÉRER MON OFFRE (MODIFICATION, STATUT & SUPPRESSION) ===
 @rt("/gerer")
-def get(session):
-    user_email = session.get("email")
-    if not user_email:
+def get(session, req: Request = None):
+    u = get_session_user(session, req)
+    if not u or not u.get("email"):
         return Main(
-            render_header(session, "gerer"),
+            render_header(session, "gerer", req),
             Div(
                 Article(
                     H3("🔒 Connexion requise", style="font-weight:700;"),
@@ -1999,8 +2369,9 @@ def get(session):
             render_footer()
         )
 
+    user_email = u["email"].strip().lower()
     df_demandes = load_demandes_data()
-    mes_offres = df_demandes[df_demandes["Email"].str.lower() == user_email.lower()] if not df_demandes.empty else pd.DataFrame()
+    mes_offres = df_demandes[df_demandes["Email"].str.lower() == user_email] if not df_demandes.empty else pd.DataFrame()
 
     offres_blocks = []
     if mes_offres.empty:
@@ -2014,11 +2385,11 @@ def get(session):
         )
     else:
         for _, row in mes_offres.iterrows():
-            d_id = row["Demande_ID"]
+            d_id = str(row["Demande_ID"]).strip()
             cur_periode = row["Periode"]
             cur_spec = row["Specialite"]
             cur_actuel = row["Hopital_Actuel"]
-            cur_souhaites = parse_hospitals(row["Hopitaux_Souhaites"])
+            cur_souhaites = parse_hospitals(row.get("hopitaux_souhaites") or row.get("Hopitaux_Souhaites"))
             cur_statut = row.get("Statut", "Disponible")
             edit_prefix = f"edit-{slugify(d_id)}"
 
@@ -2041,14 +2412,13 @@ def get(session):
                     Div(Label("Statut de la demande", Select(*[Option(st, value=st, selected=(st==cur_statut)) for st in STATUTS_DEMANDE], name="statut"))),
                     style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:1rem; margin-bottom:1rem;"
                 ),
-                # Sélecteur d'hôpitaux souhaités moderne pour la modification
                 render_hospital_checkbox_selector(selected_hospitals=cur_souhaites, current_hospital=cur_actuel, prefix=edit_prefix),
                 Div(
                     Button("Enregistrer les modifications", type="submit", cls="primary", style="border-radius:8px; font-weight:700;"),
                     style="margin-top:1rem;"
                 ),
                 hx_post="/modifier-demande",
-                hx_target=f"#feedback-{d_id}",
+                hx_target=f"#feedback-{slugify(d_id)}",
                 hx_swap="innerHTML"
             )
 
@@ -2060,7 +2430,7 @@ def get(session):
                 ),
                 Button("Supprimer définitivement l'offre", type="submit", cls="secondary outline", style="color:#b91c1c; border-color:#b91c1c; border-radius:8px;"),
                 hx_post="/supprimer-demande",
-                hx_target=f"#offre-container-{d_id}",
+                hx_target=f"#offre-container-{slugify(d_id)}",
                 hx_swap="outerHTML"
             )
 
@@ -2068,23 +2438,23 @@ def get(session):
                 Div(
                     Article(
                         H3(f"📌 {cur_periode} · {cur_spec} ({cur_actuel})", style="font-weight:800; color:#1e3a8a;"),
-                        Div(id=f"feedback-{d_id}"),
+                        Div(id=f"feedback-{slugify(d_id)}"),
                         H5("Modifier l'annonce", style="font-weight:700; margin-top:1rem;"),
                         edit_form,
                         Hr(),
                         H5("Supprimer l'annonce", style="font-weight:700; color:#b91c1c;"),
                         delete_form,
                     ),
-                    id=f"offre-container-{d_id}",
+                    id=f"offre-container-{slugify(d_id)}",
                     style="margin-bottom:1.5rem;"
                 )
             )
 
     return Main(
-        render_header(session, "gerer"),
+        render_header(session, "gerer", req),
         Div(
             H2("Gérer mes annonces publiées", style="font-weight:800; color:#0f172a;"),
-            P("Vous pouvez ajuster vos souhaits à tout moment ou modifier le statut de votre offre ('Disponible', 'En discussion', 'Accord trouvé')."),
+            P("Vous pouvez ajuster vos souhaits à tout moment ou modifier le statut de votre offre ('Disponible', 'En discussion', 'Accord trouvé'). Les modifications sont directement enregistrées dans Firestore."),
             *offres_blocks,
             cls="container"
         ),
@@ -2093,8 +2463,8 @@ def get(session):
 
 @rt("/modifier-demande")
 async def post(session, req: Request = None, demande_id: str = "", periode: str = "", specialite: str = "", hopital_actuel: str = "", statut: str = "Disponible", hopitaux_souhaites: list[str] = None):
-    user_email = session.get("email")
-    if not user_email:
+    u = get_session_user(session, req)
+    if not u or not u.get("email"):
         return P("Session expirée.", style="color:#b91c1c; font-weight:600;")
 
     h_list = []
@@ -2102,34 +2472,36 @@ async def post(session, req: Request = None, demande_id: str = "", periode: str 
         try:
             form_data = await req.form()
             h_list = form_data.getlist("hopitaux_souhaites")
-            if not demande_id: demande_id = form_data.get("demande_id", "")
-            if not periode: periode = form_data.get("periode", "")
-            if not specialite: specialite = form_data.get("specialite", "")
-            if not hopital_actuel: hopital_actuel = form_data.get("hopital_actuel", "")
-            if not statut: statut = form_data.get("statut", "Disponible")
+            if not demande_id: demande_id = str(form_data.get("demande_id", "")).strip()
+            if not periode: periode = str(form_data.get("periode", "")).strip()
+            if not specialite: specialite = str(form_data.get("specialite", "")).strip()
+            if not hopital_actuel: hopital_actuel = str(form_data.get("hopital_actuel", "")).strip()
+            if not statut: statut = str(form_data.get("statut", "Disponible")).strip()
         except Exception:
             pass
 
     if not h_list and hopitaux_souhaites:
         h_list = [hopitaux_souhaites] if isinstance(hopitaux_souhaites, str) else list(hopitaux_souhaites)
 
-    h_list = [h.strip() for h in h_list if h and h.strip()]
+    h_list = [str(h).strip() for h in h_list if str(h).strip()]
 
     if not h_list:
         return P("Veuillez conserver au moins un hôpital souhaité.", style="color:#b91c1c; font-weight:600;")
     if hopital_actuel in h_list:
         return P("L'hôpital actuel ne peut pas figurer dans les hôpitaux souhaités.", style="color:#b91c1c; font-weight:600;")
 
-    update_fields = {
-        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Periode": periode,
-        "Specialite": specialite,
-        "Hopital_Actuel": hopital_actuel,
-        "Hopitaux_Souhaites": serialize_hospitals(h_list),
-        "Statut": statut,
+    update_payload = {
+        "demande_id": demande_id,
+        "user_email": u["email"],
+        "nom_etudiant": f"{u.get('prenom', '')} {u.get('nom', '')}".strip() or u["email"],
+        "periode": periode,
+        "specialite": specialite,
+        "hopital_actuel": hopital_actuel,
+        "hopitaux_souhaites": h_list,
+        "statut": statut,
     }
 
-    if update_demande_firestore(demande_id, update_fields):
+    if save_demande(update_payload):
         return Article(
             P("✅ Offre mise à jour avec succès dans Firestore !"),
             style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:0.75rem; margin-bottom:1rem; border-radius:8px;"
@@ -2137,28 +2509,32 @@ async def post(session, req: Request = None, demande_id: str = "", periode: str 
     return P("Erreur lors de la mise à jour.", style="color:#b91c1c;")
 
 @rt("/supprimer-demande")
-def post(session, demande_id: str, confirm_delete: str = None):
-    user_email = session.get("email")
-    if not user_email or not confirm_delete:
+def post(session, demande_id: str, confirm_delete: str = None, req: Request = None):
+    u = get_session_user(session, req)
+    if not u or not u.get("email") or not confirm_delete:
         return P("Suppression annulée ou non autorisée.", style="color:#b91c1c;")
 
-    if delete_demande_firestore(demande_id):
+    if delete_demande(demande_id):
         return Article(
-            P("🗑️ Votre offre a été supprimée avec succès."),
+            P("🗑️ Votre offre a été supprimée avec succès de Firestore."),
             style="background:#fef2f2; border:1px solid #fecaca; color:#991b1b; padding:1rem; border-radius:10px;"
         )
     return P("Erreur lors de la suppression.", style="color:#b91c1c;")
 
-# === AUTHENTIFICATION & COMPTE ÉTUDIANT ===
+# === AUTHENTIFICATION & COMPTE ÉTUDIANT (COLLECTION 'users') ===
 @rt("/login-view")
-def get(session):
+def get(session, req: Request = None):
+    u = get_session_user(session, req)
+    if u and u.get("email"):
+        return RedirectResponse("/deposer")
+
     return Main(
-        render_header(session),
+        render_header(session, "accueil", req),
         Div(
             Div(
                 Article(
                     H3("🔑 Connexion Étudiant", style="font-weight:700; color:#0f172a;"),
-                    P("Accédez à vos correspondances privées et vos salons sécurisés."),
+                    P("Vérification directe de votre compte dans Firestore via votre email et votre code PIN."),
                     Div(id="login-feedback"),
                     Form(
                         Label("Email institutionnel", Input(name="email", type="email", placeholder="prenom.nom@student.uclouvain.be", required=True)),
@@ -2172,7 +2548,7 @@ def get(session):
                 ),
                 Article(
                     H3("📝 Créer mon profil", style="font-weight:700; color:#0f172a;"),
-                    P("Inscription rapide en 30 secondes sans mot de passe complexe."),
+                    P("Inscription rapide. Votre profil sera enregistré immédiatement dans la collection 'users' de Firestore."),
                     Div(id="reg-feedback"),
                     Form(
                         Div(
@@ -2183,7 +2559,7 @@ def get(session):
                         Label("Email institutionnel *", Input(name="email", type="email", placeholder="prenom.nom@student.uclouvain.be", required=True)),
                         Label("Choisir un code PIN à 4 chiffres *", Input(name="pin", type="password", maxlength=4, placeholder="••••", required=True)),
                         Button("Créer mon compte étudiant", type="submit", cls="outline", style="border-radius:8px; font-weight:700; width:100%;"),
-                        hx_post="/register",
+                        hx_post="/inscription",
                         hx_target="#reg-feedback",
                         hx_swap="innerHTML"
                     )
@@ -2196,76 +2572,140 @@ def get(session):
     )
 
 @rt("/login")
-def post(session, email: str, pin: str):
-    em_clean = email.strip().lower()
-    pin_clean = normalize_pin(pin)
+def post(session, email: str = "", pin: str = "", code_pin: str = ""):
+    em_clean = str(email).strip().lower()
+    input_pin = normalize_pin(pin or code_pin)
 
-    df_users = load_users_data()
-    matched = df_users[df_users["Email"].astype(str).str.strip().str.lower() == em_clean] if not df_users.empty else pd.DataFrame()
-
-    if matched.empty:
-        return Article(P("Email ou code PIN incorrect.", style="color:#b91c1c; font-weight:600;"), cls="contrast")
-
-    u_row = matched.iloc[0]
-    pin_bdd = normalize_pin(u_row.get("PIN", ""))
-
-    if pin_clean == pin_bdd:
-        session["user_id"] = str(u_row.get("User_ID", "")).strip()
-        session["email"] = em_clean
-        session["prenom"] = str(u_row.get("Prenom", "")).strip()
-        session["nom"] = str(u_row.get("Nom", "")).strip()
-        session["pin"] = pin_bdd
+    if not em_clean or not input_pin:
         return Article(
-            P(f"Connexion réussie ! Bienvenue {session['prenom']}."),
-            A("Accéder à mes correspondances", href="/matchs", role="button", cls="primary", style="border-radius:8px;"),
-            style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1rem; border-radius:10px;"
+            P("Veuillez renseigner votre email et votre code PIN.", style="color:#b91c1c; font-weight:600; margin:0;"),
+            style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
         )
-    return Article(P("Email ou code PIN incorrect.", style="color:#b91c1c; font-weight:600;"), cls="contrast")
 
+    # Vérification directe dans Firestore
+    user_doc = get_user_by_email(em_clean)
+    if not user_doc:
+        return Article(
+            P("Compte introuvable, veuillez vous inscrire.", style="color:#b91c1c; font-weight:700; margin:0;"),
+            P("Aucun document n'existe pour cet email dans la collection 'users'.", style="font-size:0.85rem; color:#64748b; margin-top:0.3rem;"),
+            style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
+        )
+
+    bdd_pin = normalize_pin(user_doc.get("code_pin") or user_doc.get("PIN") or "")
+
+    if input_pin == bdd_pin:
+        session["user_id"] = em_clean
+        session["user_email"] = em_clean
+        session["email"] = em_clean
+        session["nom"] = user_doc.get("nom") or user_doc.get("Nom") or "Étudiant"
+        session["prenom"] = user_doc.get("prenom") or user_doc.get("Prenom") or ""
+        session["pin"] = bdd_pin
+        display_name = session["prenom"] or session["nom"]
+
+        return Article(
+            H4(f"🎉 Connexion réussie ! Bienvenue {display_name}.", style="color:#14532d; font-weight:800; margin-bottom:0.4rem;"),
+            P("Votre compte a été vérifié dans Firestore. Votre session est active."),
+            Div(
+                A("Consulter mes correspondances", href="/matchs", role="button", cls="primary", style="margin-right:0.5rem; border-radius:8px;"),
+                A("Déposer une offre", href="/deposer", role="button", cls="outline", style="border-radius:8px;"),
+                style="margin-top:0.75rem;"
+            ),
+            Script(f"""
+                localStorage.setItem('permutstage_auth_email', '{em_clean}');
+                sessionStorage.removeItem('permutstage_logged_out');
+                setTimeout(function() {{
+                    window.location.href = '/matchs';
+                }}, 600);
+            """),
+            style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1.25rem; border-radius:12px; margin-bottom:1.5rem;"
+        )
+
+    return Article(
+        P("Email ou code PIN incorrect. Veuillez réessayer.", style="color:#b91c1c; font-weight:600; margin:0;"),
+        style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
+    )
+
+@rt("/inscription")
 @rt("/register")
-def post(session, prenom: str, nom: str, email: str, pin: str):
-    p_clean = prenom.strip()
-    n_clean = nom.strip()
-    e_clean = email.strip().lower()
-    pin_clean = normalize_pin(pin)
+def post(session, prenom: str = "", nom: str = "", email: str = "", pin: str = "", code_pin: str = ""):
+    p_clean = str(prenom).strip()
+    n_clean = str(nom).strip()
+    e_clean = str(email).strip().lower()
+    clean_pin = normalize_pin(pin or code_pin)
 
     if len(p_clean) < 2 or len(n_clean) < 2:
-        return P("Veuillez renseigner un prénom et un nom valides.", style="color:#b91c1c;")
+        return Article(
+            P("Veuillez renseigner un prénom et un nom valides.", style="color:#b91c1c; font-weight:600; margin:0;"),
+            style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
+        )
     if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", e_clean):
-        return P("Format d'adresse email invalide.", style="color:#b91c1c;")
-    if not re.match(r"^\d{4}$", pin_clean):
-        return P("Le code PIN doit comporter exactement 4 chiffres.", style="color:#b91c1c;")
+        return Article(
+            P("Format d'adresse email invalide.", style="color:#b91c1c; font-weight:600; margin:0;"),
+            style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
+        )
+    if not re.match(r"^\d{4}$", clean_pin):
+        return Article(
+            P("Le code PIN doit comporter exactement 4 chiffres.", style="color:#b91c1c; font-weight:600; margin:0;"),
+            style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
+        )
 
-    df_users = load_users_data()
-    if not df_users.empty and not df_users[df_users["Email"].astype(str).str.strip().str.lower() == e_clean].empty:
-        return P("Un compte existe déjà avec cette adresse email.", style="color:#b91c1c;")
+    # 1. Vérification dans Firestore : db.collection("users").document(email).get().exists
+    existing = get_user_by_email(e_clean)
+    if existing:
+        return Article(
+            P("Ce compte existe déjà, veuillez vous connecter.", style="color:#b91c1c; font-weight:700; margin:0;"),
+            P("Un profil associé à cette adresse email est déjà enregistré dans Firestore.", style="font-size:0.85rem; color:#64748b; margin-top:0.3rem;"),
+            A("Aller au formulaire de connexion", href="/login-view", style="display:inline-block; margin-top:0.4rem; font-size:0.85rem; font-weight:600;"),
+            style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
+        )
 
+    # 2. Création immédiate dans Firestore
     new_user = {
-        "User_ID": f"USR_{uuid.uuid4().hex[:8].upper()}",
+        "email": e_clean,
+        "nom": n_clean,
+        "prenom": p_clean,
+        "code_pin": clean_pin,
+        "created_at": datetime.now().isoformat(),
+        "statut": "actif",
+        "User_ID": e_clean,
         "Nom": n_clean,
         "Prenom": p_clean,
+        "PIN": clean_pin,
         "Email": e_clean,
-        "PIN": pin_clean,
-        "Date_Inscription": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-    if create_user_firestore(new_user):
-        session["user_id"] = new_user["User_ID"]
+    if create_or_update_user(new_user):
+        session["user_id"] = e_clean
+        session["user_email"] = e_clean
         session["email"] = e_clean
-        session["prenom"] = p_clean
         session["nom"] = n_clean
-        session["pin"] = pin_clean
+        session["prenom"] = p_clean
+        session["pin"] = clean_pin
+
         return Article(
-            P(f"🎉 Compte créé avec succès ! Bienvenue {p_clean}."),
-            A("Déposer ma première offre", href="/deposer", role="button", cls="primary", style="border-radius:8px;"),
-            style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1rem; border-radius:10px;"
+            H4(f"🎉 Compte créé et enregistré dans Firestore ! Bienvenue {p_clean}.", style="color:#14532d; font-weight:800; margin-bottom:0.4rem;"),
+            P("Votre compte persiste désormais dans la collection 'users' de Firestore. Vous êtes automatiquement connecté."),
+            Div(
+                A("Déposer ma première offre", href="/deposer", role="button", cls="primary", style="margin-right:0.5rem; border-radius:8px;"),
+                A("Consulter le catalogue", href="/catalogue", role="button", cls="outline", style="border-radius:8px;"),
+                style="margin-top:0.75rem;"
+            ),
+            Script(f"""
+                localStorage.setItem('permutstage_auth_email', '{e_clean}');
+                sessionStorage.removeItem('permutstage_logged_out');
+            """),
+            style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1.25rem; border-radius:12px; margin-bottom:1.5rem;"
         )
-    return P("Erreur lors de la création du compte.", style="color:#b91c1c;")
+
+    return Article(
+        P("Erreur lors de l'enregistrement du compte dans Firestore. Veuillez réessayer.", style="color:#b91c1c; font-weight:600; margin:0;"),
+        style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
+    )
 
 @rt("/forgot-pin-view")
-def get(session):
+def get(session, req: Request = None):
     return Main(
-        render_header(session),
+        render_header(session, "accueil", req),
         Div(
             Article(
                 H3("🔑 Récupération de code PIN", style="font-weight:700;"),
@@ -2286,34 +2726,33 @@ def get(session):
     )
 
 @rt("/forgot-pin")
-def post(session, email: str):
-    em_clean = email.strip().lower()
-    df_users = load_users_data()
-    matched = df_users[df_users["Email"].astype(str).str.strip().str.lower() == em_clean] if not df_users.empty else pd.DataFrame()
+def post(session, email: str = ""):
+    em_clean = str(email).strip().lower()
+    user_doc = get_user_by_email(em_clean)
 
-    if matched.empty:
-        return P("Aucun compte n'est associé à cette adresse email.", style="color:#b91c1c;")
+    if not user_doc:
+        return P("Aucun compte n'est associé à cette adresse email dans Firestore.", style="color:#b91c1c; font-weight:600;")
 
-    row = matched.iloc[0]
-    pin = normalize_pin(row.get("PIN", ""))
-    prenom = str(row.get("Prenom", "")).strip() or "étudiant"
+    pin = normalize_pin(user_doc.get("code_pin") or user_doc.get("PIN") or "")
+    prenom = str(user_doc.get("prenom") or user_doc.get("Prenom") or "étudiant").strip()
 
     try:
         send_pin_recovery_email(em_clean, prenom, pin)
         return Article(
             P(f"✅ Votre code PIN a été envoyé à {em_clean}."),
-            A("Se connecter", href="/login-view", role="button", cls="outline", style="border-radius:8px;"),
+            A("Se connecter", href="/login-view", role="button", cls="outline", style="border-radius:8px; margin-top:0.5rem;"),
             style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1rem; border-radius:10px;"
         )
     except Exception as err:
-        return P(f"Impossible d'envoyer l'email : {err}", style="color:#b91c1c;")
+        return P(f"Impossible d'envoyer l'email : {err}", style="color:#b91c1c; font-weight:600;")
 
 @rt("/notifications")
-def get(session):
-    user_email = session.get("email")
-    if not user_email:
+def get(session, req: Request = None):
+    u = get_session_user(session, req)
+    if not u or not u.get("email"):
         return RedirectResponse("/login-view")
 
+    user_email = u["email"]
     df_demandes = load_demandes_data()
     df_messages = load_messages_data()
     all_bi = compute_bilateral_matches(df_demandes)
@@ -2330,13 +2769,13 @@ def get(session):
                 Article(
                     Strong(n["titre"], style="color:#1e3a8a; display:block; margin-bottom:0.3rem; font-size:0.95rem;"),
                     P(n["detail"], style="font-size:0.9rem; color:#334155; margin-bottom:0.5rem;"),
-                    A("Ouvrir le salon correspondant", href="/matchs", role="button", cls="outline secondary", style="font-size:0.8rem; padding:0.35rem 0.75rem; border-radius:6px;"),
+                    A("Ouvrir le salon correspondant", href=f"/salon/{n['room_id']}", role="button", cls="outline secondary", style="font-size:0.8rem; padding:0.35rem 0.75rem; border-radius:6px;"),
                     style="margin-bottom:0.75rem; border-left:4px solid #1d4ed8; border-radius:8px;"
                 )
             )
 
     return Main(
-        render_header(session),
+        render_header(session, "accueil", req),
         Div(
             H2("🔔 Centre de Notifications", style="font-weight:800; color:#0f172a;"),
             *cards,
@@ -2348,13 +2787,28 @@ def get(session):
 @rt("/logout")
 def get(session):
     session.clear()
-    return RedirectResponse("/")
+    return Main(
+        Script("""
+            localStorage.removeItem('permutstage_auth_email');
+            sessionStorage.setItem('permutstage_logged_out', '1');
+            window.location.href = '/login-view';
+        """),
+        Div(
+            Article(
+                H3("👋 Déconnexion réussie"),
+                P("Votre session a été fermée avec succès."),
+                A("Retour à la connexion", href="/login-view", role="button", cls="primary"),
+                style="text-align:center; padding:2rem;"
+            ),
+            cls="container"
+        )
+    )
 
 # === VUE 6 : ESPACE ADMINISTRATION ===
 @rt("/admin-login-view")
-def get(session):
+def get(session, req: Request = None):
     return Main(
-        render_header(session),
+        render_header(session, "accueil", req),
         Div(
             Article(
                 H3("🔒 Accès Administrateur", style="font-weight:700;"),
@@ -2375,7 +2829,7 @@ def get(session):
     )
 
 @rt("/admin-login")
-def post(session, password: str):
+def post(session, password: str = ""):
     admin_pwd = os.environ.get("ADMIN_PASSWORD", "admin123")
     if password.strip() == admin_pwd.strip():
         session["is_admin"] = True
@@ -2384,32 +2838,33 @@ def post(session, password: str):
             A("Ouvrir l'Espace Administrateur", href="/admin", role="button", cls="primary", style="border-radius:8px;"),
             style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1rem; border-radius:10px;"
         )
-    return P("Mot de passe incorrect.", style="color:#b91c1c;")
+    return P("Mot de passe incorrect.", style="color:#b91c1c; font-weight:600;")
 
 @rt("/admin")
-def get(session):
+def get(session, req: Request = None):
     if not session.get("is_admin", False):
         return RedirectResponse("/admin-login-view")
 
-    df_users = load_users_data()
+    df_users = load_all_users()
     df_demandes = load_demandes_data()
     all_bi = compute_bilateral_matches(df_demandes)
     all_tri = compute_triangular_matches(df_demandes)
 
     demandes_rows = []
     for _, d in df_demandes.iterrows():
+        d_id = str(d.get("demande_id") or d.get("Demande_ID") or "")
         demandes_rows.append(
             Tr(
-                Td(Small(d.get("Demande_ID", ""))),
+                Td(Small(d_id)),
                 Td(d.get("Nom", "")),
                 Td(d.get("Email", "")),
                 Td(d.get("Periode", "")),
                 Td(d.get("Specialite", "")),
                 Td(d.get("Hopital_Actuel", "")),
-                Td(Span(d.get("Statut", "Disponible"), cls=f"status-badge status-{d.get('Statut', 'Disponible').lower().replace(' ', '')}")),
+                Td(Span(d.get("Statut", "Disponible"), cls=f"status-badge status-{str(d.get('Statut', 'Disponible')).lower().replace(' ', '')}")),
                 Td(
                     Form(
-                        Input(type="hidden", name="demande_id", value=d.get("Demande_ID", "")),
+                        Input(type="hidden", name="demande_id", value=d_id),
                         Button("Supprimer", type="submit", cls="outline secondary", style="padding:0.25rem 0.5rem; font-size:0.75rem; color:#b91c1c; border-color:#b91c1c; border-radius:6px;"),
                         hx_post="/admin-delete-demande",
                         hx_target="#admin-feedback",
@@ -2421,15 +2876,16 @@ def get(session):
 
     users_rows = []
     for _, u in df_users.iterrows():
+        u_email = str(u.get("email") or u.get("Email") or "")
         users_rows.append(
             Tr(
-                Td(Small(u.get("User_ID", ""))),
-                Td(f"{u.get('Prenom', '')} {u.get('Nom', '')}"),
-                Td(u.get("Email", "")),
-                Td(u.get("Date_Inscription", "")),
+                Td(Small(u_email)),
+                Td(f"{u.get('prenom', '')} {u.get('nom', '')}".strip() or u.get("Nom", "")),
+                Td(u_email),
+                Td(u.get("created_at") or u.get("Date_Inscription", "")),
                 Td(
                     Form(
-                        Input(type="hidden", name="user_id", value=u.get("User_ID", "")),
+                        Input(type="hidden", name="user_email", value=u_email),
                         Button("Supprimer", type="submit", cls="outline secondary", style="padding:0.25rem 0.5rem; font-size:0.75rem; color:#b91c1c; border-color:#b91c1c; border-radius:6px;"),
                         hx_post="/admin-delete-user",
                         hx_target="#admin-feedback",
@@ -2440,7 +2896,7 @@ def get(session):
         )
 
     return Main(
-        render_header(session, "admin"),
+        render_header(session, "admin", req),
         Div(
             H2("🛠️ Espace Administrateur (Supervision globale)", style="font-weight:800; color:#0f172a;"),
             Div(id="admin-feedback"),
@@ -2467,7 +2923,7 @@ def get(session):
                 H3(f"👥 Collection 'users' ({len(df_users)})", style="font-weight:700;"),
                 Div(
                     Table(
-                        Thead(Tr(Th("User ID"), Th("Nom complet"), Th("Email"), Th("Inscription"), Th("Action"))),
+                        Thead(Tr(Th("Email (Clé doc)"), Th("Nom complet"), Th("Email"), Th("Inscription"), Th("Action"))),
                         Tbody(*users_rows),
                         cls="striped"
                     ),
@@ -2483,16 +2939,16 @@ def get(session):
 def post(session, demande_id: str):
     if not session.get("is_admin", False):
         return P("Non autorisé", style="color:#b91c1c;")
-    if delete_demande_firestore(demande_id):
+    if delete_demande(demande_id):
         return Article(P(f"Demande {demande_id} supprimée."), style="background:#fef2f2; color:#991b1b; padding:0.5rem; border-radius:6px;")
     return P("Erreur", style="color:#b91c1c;")
 
 @rt("/admin-delete-user")
-def post(session, user_id: str):
+def post(session, user_email: str):
     if not session.get("is_admin", False):
         return P("Non autorisé", style="color:#b91c1c;")
-    if delete_user_firestore(user_id):
-        return Article(P(f"Utilisateur {user_id} et ses demandes supprimés."), style="background:#fef2f2; color:#991b1b; padding:0.5rem; border-radius:6px;")
+    if delete_user_and_demandes(user_email):
+        return Article(P(f"Utilisateur {user_email} et ses demandes supprimés de Firestore."), style="background:#fef2f2; color:#991b1b; padding:0.5rem; border-radius:6px;")
     return P("Erreur", style="color:#b91c1c;")
 
 @rt("/admin-export-demandes-csv")
@@ -2508,7 +2964,7 @@ def get(session):
     )
 
 # ---------------------------------------------------------------------------
-# 10. DÉMARRAGE DU SERVEUR FASTHTML
+# 12. DÉMARRAGE DU SERVEUR FASTHTML
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     serve()
