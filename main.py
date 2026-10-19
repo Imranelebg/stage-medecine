@@ -13,10 +13,8 @@ Architecture complète dans un fichier unique main.py avec persistance Firestore
 - Moteur de matching bilatéral (A <-> B) et triangulaire (A -> B -> C -> A) avec confidentialité absolue.
 - Système d'alertes par email SMTP automatique lors de la formation d'un cycle complet.
 
-Exécution locale :
+Exécution :
     python main.py
-Exécution Render / Cloud :
-    uvicorn main:app --host 0.0.0.0 --port $PORT
 """
 
 from fasthtml.common import *
@@ -374,32 +372,9 @@ CUSTOM_STYLE = Style("""
     }
 """)
 
-AUTH_SYNC_SCRIPT = Script("""
-    // Synchronisation automatique et persistance du compte étudiant dans le navigateur
-    (function() {
-        try {
-            const savedEmail = localStorage.getItem('permutstage_auth_email');
-            const url = new URL(window.location.href);
-            const path = url.pathname;
-            const hasAuthParam = url.searchParams.has('auth');
-            const isLogout = path === '/logout';
-            const isLoginView = path === '/login-view';
-            const loggedOutFlag = sessionStorage.getItem('permutstage_logged_out');
-
-            if (savedEmail && !hasAuthParam && !isLogout && !loggedOutFlag) {
-                const headerProfile = document.querySelector('.auth-connected-indicator');
-                if (!headerProfile && !isLoginView) {
-                    url.searchParams.set('auth', savedEmail);
-                    window.location.replace(url.toString());
-                }
-            }
-        } catch(e) {}
-    })();
-""")
-
 app, rt = fast_app(
     pico=True,
-    live=True,
+    live=False,
     secret_key=os.environ.get("SESSION_SECRET", "clé_secrete_session_permutstage"),
     hdrs=(
         Title("PermutStage — Permutation de Stages Médecine"),
@@ -409,7 +384,6 @@ app, rt = fast_app(
         Link(rel="preconnect", href="https://fonts.gstatic.com", crossorigin=""),
         Link(rel="stylesheet", href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"),
         CUSTOM_STYLE,
-        AUTH_SYNC_SCRIPT,
     ),
 )
 
@@ -507,6 +481,7 @@ HOPITAL_VERS_REGION = {
 
 STATUTS_DEMANDE = ["Disponible", "En discussion", "Accord trouvé"]
 
+# Les 4 collections Firestore officielles
 COLLECTION_USERS = "users"
 COLLECTION_DEMANDES = "demandes"
 COLLECTION_DISCUSSIONS = "discussions"
@@ -528,6 +503,7 @@ _FIRESTORE_CLIENT = None
 LOCAL_DB_FILE = os.path.join(os.path.dirname(__file__), ".permutstage_local_db.json")
 
 def load_local_db() -> dict:
+    """Charge la base locale persistante pour garantir zéro perte de données même hors-ligne."""
     if os.path.exists(LOCAL_DB_FILE):
         try:
             with open(LOCAL_DB_FILE, "r", encoding="utf-8") as f:
@@ -537,6 +513,7 @@ def load_local_db() -> dict:
     return {"users": {}, "demandes": {}, "discussions": {}, "messages": {}}
 
 def save_local_db(data: dict):
+    """Écrit atomiquement sur disque local pour préserver les comptes et offres à chaque visite."""
     try:
         with open(LOCAL_DB_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -544,6 +521,10 @@ def save_local_db(data: dict):
         print(f"[PermutStage] Erreur sauvegarde locale: {exc}")
 
 def get_firestore_client():
+    """
+    Initialise l'instance client Firebase Firestore de façon protégée.
+    Prend en charge FIREBASE_CREDENTIALS, FIREBASE_CONFIG, secrets.toml et Google Cloud ADC.
+    """
     global _FIRESTORE_CLIENT
     if _FIRESTORE_CLIENT is not None:
         return _FIRESTORE_CLIENT
@@ -626,6 +607,10 @@ def get_firestore_client():
 # 4. GESTION FIRESTORE : UTILISATEURS & AUTHENTIFICATION (COLLECTION 'users')
 # ---------------------------------------------------------------------------
 def get_user_by_email(email: str) -> dict | None:
+    """
+    Récupère un compte utilisateur directement depuis Firestore par son email clé.
+    Vérifie db.collection('users').document(email.lower().strip()).get().
+    """
     clean_email = (email or "").strip().lower()
     if not clean_email:
         return None
@@ -638,12 +623,14 @@ def get_user_by_email(email: str) -> dict | None:
                 data = doc.to_dict() or {}
                 data["email"] = clean_email
                 data["code_pin"] = normalize_pin(data.get("code_pin") or data.get("PIN") or "")
+                # Sauvegarder dans le cache local
                 local = load_local_db()
                 if "users" not in local: local["users"] = {}
                 local["users"][clean_email] = data
                 save_local_db(local)
                 return data
 
+            # Vérification de repli par requête champ 'email' ou 'Email'
             for field in ["email", "Email", "User_ID"]:
                 q = db.collection(COLLECTION_USERS).where(field, "==", clean_email).limit(1).stream()
                 for d in q:
@@ -658,6 +645,7 @@ def get_user_by_email(email: str) -> dict | None:
         except Exception as exc:
             print(f"[PermutStage] Erreur lecture Firestore user {clean_email}: {exc}")
 
+    # Repli sur le stockage persistant local
     local = load_local_db()
     users_dict = local.get("users", {})
     if clean_email in users_dict:
@@ -667,6 +655,11 @@ def get_user_by_email(email: str) -> dict | None:
     return None
 
 def create_or_update_user(user_data: dict) -> bool:
+    """
+    Enregistre le document utilisateur dans la collection 'users' de Firestore
+    avec comme clé unique l'email de l'étudiant (.document(email.lower().strip())).
+    Champs requis : email, nom, code_pin, created_at, statut.
+    """
     clean_email = user_data["email"].strip().lower()
     pin = normalize_pin(user_data.get("code_pin") or user_data.get("PIN") or "")
     nom = user_data.get("nom") or user_data.get("Nom") or ""
@@ -681,6 +674,7 @@ def create_or_update_user(user_data: dict) -> bool:
         "code_pin": pin,
         "created_at": created_at,
         "statut": statut,
+        # Rétro-compatibilité schémas existants
         "User_ID": clean_email,
         "Nom": nom,
         "Prenom": prenom,
@@ -689,6 +683,7 @@ def create_or_update_user(user_data: dict) -> bool:
         "Date_Inscription": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
+    # 1. Écriture Firestore
     db = get_firestore_client()
     if db is not None:
         try:
@@ -696,6 +691,7 @@ def create_or_update_user(user_data: dict) -> bool:
         except Exception as exc:
             print(f"[PermutStage] Erreur écriture Firestore user: {exc}")
 
+    # 2. Écriture persistante sur disque local
     local = load_local_db()
     if "users" not in local: local["users"] = {}
     local["users"][clean_email] = doc_payload
@@ -703,6 +699,7 @@ def create_or_update_user(user_data: dict) -> bool:
     return True
 
 def update_user_pin(email: str, new_pin: str) -> bool:
+    """Met à jour le code PIN de l'étudiant dans Firestore et synchronise ses demandes."""
     clean_email = email.strip().lower()
     clean_pin = normalize_pin(new_pin)
     db = get_firestore_client()
@@ -730,6 +727,7 @@ def update_user_pin(email: str, new_pin: str) -> bool:
     return True
 
 def delete_user_and_demandes(email: str) -> bool:
+    """Supprime l'utilisateur et ses demandes associées en cascade."""
     clean_email = email.strip().lower()
     db = get_firestore_client()
     if db is not None:
@@ -750,6 +748,7 @@ def delete_user_and_demandes(email: str) -> bool:
     return True
 
 def load_all_users() -> pd.DataFrame:
+    """Lit l'ensemble des comptes de la collection 'users'."""
     db = get_firestore_client()
     users_list = []
     if db is not None:
@@ -774,6 +773,7 @@ def load_all_users() -> pd.DataFrame:
     df = pd.DataFrame(users_list)
     for c in ["email", "nom", "prenom", "code_pin", "created_at", "statut"]:
         if c not in df.columns: df[c] = ""
+    # Aliases
     df["Email"] = df["email"]
     df["Nom"] = df["nom"]
     df["Prenom"] = df["prenom"]
@@ -795,6 +795,10 @@ def parse_hospitals(raw_val) -> list[str]:
     return [str(h).strip() for h in str(raw_val).split(";") if str(h).strip()]
 
 def save_demande(demande_dict: dict) -> bool:
+    """
+    Enregistre ou met à jour une offre de permutation dans la collection 'demandes'.
+    Champs : user_email, nom_etudiant, periode, specialite, hopital_actuel, hopitaux_souhaites, statut, updated_at.
+    """
     user_email = demande_dict.get("user_email") or demande_dict.get("Email") or ""
     user_email = str(user_email).strip().lower()
     periode = str(demande_dict.get("periode") or demande_dict.get("Periode") or "").strip()
@@ -848,6 +852,7 @@ def save_demande(demande_dict: dict) -> bool:
     return True
 
 def delete_demande(demande_id: str) -> bool:
+    """Supprime une offre de stage dans Firestore."""
     clean_id = str(demande_id).strip()
     db = get_firestore_client()
     if db is not None:
@@ -862,6 +867,7 @@ def delete_demande(demande_id: str) -> bool:
     return True
 
 def load_demandes_data() -> pd.DataFrame:
+    """Lit toutes les annonces de la collection 'demandes'."""
     db = get_firestore_client()
     demandes_list = []
     if db is not None:
@@ -909,6 +915,10 @@ def load_demandes_data() -> pd.DataFrame:
 # 6. GESTION FIRESTORE : DISCUSSIONS & MESSAGERIE (COLLECTIONS 'discussions', 'messages')
 # ---------------------------------------------------------------------------
 def creer_ou_recuperer_discussion(participants: list[str], type_match: str, demande_ids: list[str]) -> dict:
+    """
+    Crée ou retrouve un salon de discussion dans Firestore.
+    Champs : type_match, participants, demande_ids, dernier_message, dernier_timestamp.
+    """
     sorted_p = sorted([p.lower().strip() for p in participants if p and p.strip()])
     disc_id = f"disc_{type_match}_{'_'.join(sorted_p)}".replace("@", "_at_").replace(".", "_")
 
@@ -952,6 +962,10 @@ def creer_ou_recuperer_discussion(participants: list[str], type_match: str, dema
     return payload
 
 def envoyer_message(discussion_id: str, sender_email: str, sender_name: str, texte: str) -> bool:
+    """
+    Insère un message dans Firestore (collection 'messages')
+    et met à jour la discussion parente (collection 'discussions').
+    """
     clean_text = texte.strip()
     if not clean_text:
         return False
@@ -996,6 +1010,7 @@ def envoyer_message(discussion_id: str, sender_email: str, sender_name: str, tex
     return True
 
 def recuperer_messages(discussion_id: str) -> list[dict]:
+    """Récupère l'ensemble des messages d'une discussion triés chronologiquement."""
     db = get_firestore_client()
     messages_list = []
     if db is not None:
@@ -1020,6 +1035,7 @@ def recuperer_messages(discussion_id: str) -> list[dict]:
     return messages_list
 
 def recuperer_discussions_utilisateur(user_email: str) -> list[dict]:
+    """Récupère tous les salons auxquels participe un utilisateur."""
     clean_email = user_email.strip().lower()
     db = get_firestore_client()
     discs = []
@@ -1042,6 +1058,7 @@ def recuperer_discussions_utilisateur(user_email: str) -> list[dict]:
 COLONNES_MESSAGES = ["Message_ID", "Room_ID", "Sender_Email", "Sender_Name", "Timestamp", "Texte"]
 
 def load_messages_data() -> pd.DataFrame:
+    """Compatibilité pour les compteurs et alertes."""
     db = get_firestore_client()
     data = []
     if db is not None:
@@ -1605,6 +1622,13 @@ def render_hospital_checkbox_selector(
 # 10. EN-TÊTE & PIED DE PAGE GLOBAUX
 # ---------------------------------------------------------------------------
 def get_session_user(session, req: Request = None) -> dict | None:
+    """
+    Charge le profil complet de l'utilisateur connecté depuis Firestore.
+    Priorité :
+    1. session['user_id'] ou session['user_email'] ou session['email']
+    2. req.query_params.get('auth') ou req.query_params.get('user_email')
+    Recharge directement depuis Firestore db.collection('users').document(email).get().
+    """
     user_email = session.get("user_id") or session.get("user_email") or session.get("email")
     if not user_email and req is not None:
         try:
@@ -1621,6 +1645,20 @@ def get_session_user(session, req: Request = None) -> dict | None:
         return None
 
     clean_email = str(user_email).strip().lower()
+    # Si la session contient déjà le nom et prénom, retourner directement sans requête Firestore
+    if session.get("nom") and session.get("prenom"):
+        return {
+            "email": clean_email,
+            "Email": clean_email,
+            "nom": session.get("nom"),
+            "Nom": session.get("nom"),
+            "prenom": session.get("prenom"),
+            "Prenom": session.get("prenom"),
+            "code_pin": session.get("pin", ""),
+            "PIN": session.get("pin", ""),
+            "statut": "actif",
+        }
+
     user_data = get_user_by_email(clean_email)
     if user_data:
         session["user_id"] = clean_email
@@ -1645,25 +1683,21 @@ def get_session_user(session, req: Request = None) -> dict | None:
     }
 
 def render_header(session, active_tab="accueil", req: Request = None):
+    """
+    En-tête ultra-léger et rapide : aucun calcul de matching ni requête lourde Firestore.
+    Le calcul des correspondances est réservé exclusivement à la page dédiée /matchs.
+    """
     current_u = get_session_user(session, req)
     user_email = current_u.get("email") if current_u else None
     user_prenom = current_u.get("prenom") if current_u else ""
     user_nom = current_u.get("nom") if current_u else ""
     is_admin = session.get("is_admin", False)
 
-    df_demandes = load_demandes_data()
-    df_messages = load_messages_data()
-    all_bi = compute_bilateral_matches(df_demandes)
-    all_tri = compute_triangular_matches(df_demandes)
-    my_bi, my_tri = filter_private_matches_for_user(user_email, all_bi, all_tri)
-    nb_mes_matchs = len(my_bi) + len(my_tri)
-    notifs = build_user_notifications(user_email, my_bi, my_tri, df_messages)
-
     tabs = [
         ("accueil", "Accueil & Guide", "/"),
         ("deposer", "1. Déposer une demande", "/deposer"),
-        ("matchs", f"2. Mes Matchs & Salons ({nb_mes_matchs})", "/matchs"),
-        ("catalogue", f"3. Catalogue public ({len(df_demandes)})", "/catalogue"),
+        ("matchs", "2. Mes Matchs & Salons", "/matchs"),
+        ("catalogue", "3. Catalogue public", "/catalogue"),
         ("gerer", "4. Gérer mon offre", "/gerer"),
     ]
     if is_admin:
@@ -1683,7 +1717,7 @@ def render_header(session, active_tab="accueil", req: Request = None):
                 style="font-weight:700; font-size:0.85rem; color:#1e293b; background:#f1f5f9; padding:0.35rem 0.75rem; border-radius:9999px; margin-right:0.6rem; border:1px solid #e2e8f0;"
             ),
             A(
-                f"🔔 ({len(notifs)})",
+                "🔔 Notifications",
                 href="/notifications",
                 role="button",
                 cls="outline",
@@ -1778,6 +1812,7 @@ def get(session, req: Request = None):
                 ),
                 cls="hero-banner"
             ),
+            # KPIs
             Div(
                 Div(Div(str(len(df_users)), cls="stat-val"), Div("Étudiants inscrits", cls="stat-lbl"), cls="stat-card"),
                 Div(Div(str(len(df_demandes)), cls="stat-val"), Div("Offres actives", cls="stat-lbl"), cls="stat-card"),
@@ -1785,6 +1820,7 @@ def get(session, req: Request = None):
                 Div(Div(str(len(all_tri)), cls="stat-val"), Div("Cycles triangulaires (3)", cls="stat-lbl"), cls="stat-card"),
                 style="display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:1rem; margin-bottom:2rem;"
             ),
+            # Les 4 étapes
             H3("🧭 Le parcours en 4 étapes simples", style="font-weight:800; color:#0f172a; margin-bottom:1rem;"),
             Div(
                 Article(
@@ -1805,6 +1841,7 @@ def get(session, req: Request = None):
                 ),
                 style="display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:1rem; margin-bottom:2rem;"
             ),
+            # Règles & Confidentialité
             Div(
                 Article(
                     H4("⚖️ Règles d'échange", style="color:#0f172a; font-weight:700;"),
@@ -2531,6 +2568,7 @@ def post(session, email: str = "", pin: str = "", code_pin: str = ""):
             style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
         )
 
+    # Vérification directe dans Firestore
     user_doc = get_user_by_email(em_clean)
     if not user_doc:
         return Article(
@@ -2597,6 +2635,7 @@ def post(session, prenom: str = "", nom: str = "", email: str = "", pin: str = "
             style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
         )
 
+    # 1. Vérification dans Firestore : db.collection("users").document(email).get().exists
     existing = get_user_by_email(e_clean)
     if existing:
         return Article(
@@ -2606,6 +2645,7 @@ def post(session, prenom: str = "", nom: str = "", email: str = "", pin: str = "
             style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
         )
 
+    # 2. Création immédiate dans Firestore
     new_user = {
         "email": e_clean,
         "nom": n_clean,
