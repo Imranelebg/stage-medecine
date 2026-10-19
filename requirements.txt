@@ -1,3 +1,5 @@
-streamlit>=1.38.0
-firebase-admin>=6.5.0
-pandas>=2.2.0
+python-fasthtml
+uvicorn
+firebase-admin
+google-cloud-firestore
+pandas
