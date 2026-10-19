@@ -160,24 +160,25 @@ st.markdown(
         color: #1e293b !important;
     }
 
-    /* Typographie générale : titres, paragraphes, spans, listes */
-    h1, h2, h3, h4, h5, h6 {
+    /* Typographie native Streamlit (encapsulée dans .stApp, sans sélecteur générique isolé) */
+    .stApp [data-testid="stMarkdownContainer"] > h1,
+    .stApp [data-testid="stMarkdownContainer"] > h2,
+    .stApp [data-testid="stMarkdownContainer"] > h3,
+    .stApp [data-testid="stMarkdownContainer"] > h4,
+    .stApp [data-testid="stMarkdownContainer"] > h5,
+    .stApp [data-testid="stMarkdownContainer"] > h6 {
         color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
         font-family: 'Plus Jakarta Sans', sans-serif !important;
         font-weight: 700 !important;
     }
 
-    p, span, div, li, td, th {
-        color: #1e293b;
-    }
-
-    .stMarkdown,
-    .stMarkdown p,
-    .stMarkdown li,
-    [data-testid="stMarkdownContainer"] p,
-    [data-testid="stMarkdownContainer"] li,
-    [data-testid="stMarkdownContainer"] span {
+    .stApp [data-testid="stMarkdownContainer"] > p,
+    .stApp [data-testid="stMarkdownContainer"] > ul,
+    .stApp [data-testid="stMarkdownContainer"] > ol,
+    .stApp [data-testid="stMarkdownContainer"] > li {
         color: #1e293b !important;
+        -webkit-text-fill-color: #1e293b !important;
     }
 
     /* Libellés de champs (Labels) bien sombres et lisibles */
@@ -186,6 +187,7 @@ st.markdown(
     [data-testid="stWidgetLabel"] p,
     [data-testid="stWidgetLabel"] span {
         color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
         font-weight: 600 !important;
         font-size: 0.88rem !important;
     }
@@ -195,6 +197,7 @@ st.markdown(
     [data-testid="stCaptionContainer"] p,
     [data-testid="stCaptionContainer"] span {
         color: #64748b !important;
+        -webkit-text-fill-color: #64748b !important;
     }
 
     /* Champs de saisie (Inputs textuels, mots de passe, textareas) */
@@ -427,12 +430,14 @@ st.markdown(
     [data-testid="stMarkdownContainer"] .hero-card div,
     [data-testid="stMarkdownContainer"] .hero-banner div {
         color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
     }
 
     .hero-card,
     .hero-banner {
         background: linear-gradient(135deg, #1e3a8a 0%, #172554 100%) !important;
         color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
         padding: 2.2rem 2.4rem !important;
         border-radius: 14px !important;
         margin-bottom: 1.25rem !important;
@@ -449,6 +454,7 @@ st.markdown(
         line-height: 1.25 !important;
         margin: 0 0 0.5rem 0 !important;
         color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
     }
 
     .hero-card p,
@@ -460,6 +466,7 @@ st.markdown(
         margin: 0 0 1.25rem 0 !important;
         max-width: 860px !important;
         color: #E2E8F0 !important;
+        -webkit-text-fill-color: #E2E8F0 !important;
     }
 
     .hero-card .hero-badge,
@@ -475,6 +482,7 @@ st.markdown(
         font-weight: 700 !important;
         letter-spacing: 0.05em !important;
         color: #BFDBFE !important;
+        -webkit-text-fill-color: #BFDBFE !important;
         margin-bottom: 0.85rem !important;
     }
 
@@ -489,6 +497,7 @@ st.markdown(
         font-size: 0.88rem !important;
         line-height: 1.55 !important;
         color: #F8FAFC !important;
+        -webkit-text-fill-color: #F8FAFC !important;
     }
 
     .hero-card .hero-alpha-box strong,
@@ -496,6 +505,7 @@ st.markdown(
     [data-testid="stMarkdownContainer"] .hero-card .hero-alpha-box strong,
     [data-testid="stMarkdownContainer"] .hero-banner .hero-alpha-box strong {
         color: #FDE047 !important;
+        -webkit-text-fill-color: #FDE047 !important;
     }
 
     .hero-card .hero-alpha-box em,
@@ -503,6 +513,7 @@ st.markdown(
     [data-testid="stMarkdownContainer"] .hero-card .hero-alpha-box em,
     [data-testid="stMarkdownContainer"] .hero-banner .hero-alpha-box em {
         color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
     }
 
     /* ==========================================================================
@@ -512,10 +523,20 @@ st.markdown(
         background-color: #ffffff !important;
         border: 1px solid #e2e8f0 !important;
         color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
         padding: 1.25rem 1.75rem !important;
         border-radius: 10px !important;
         margin-bottom: 1.25rem !important;
         box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
+    }
+
+    .permut-banner *,
+    .permut-banner p,
+    .permut-banner span,
+    .permut-banner div,
+    .permut-banner strong {
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
     }
 
     .match-card {
@@ -525,15 +546,23 @@ st.markdown(
         padding: 1.25rem !important;
         margin-bottom: 1rem !important;
         color: #14532d !important;
+        -webkit-text-fill-color: #14532d !important;
         box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
     }
 
-    .match-card * {
+    .match-card,
+    .match-card *,
+    .match-card p,
+    .match-card span,
+    .match-card div,
+    .match-card strong {
         color: #14532d !important;
+        -webkit-text-fill-color: #14532d !important;
     }
 
     .match-card a {
         color: #15803d !important;
+        -webkit-text-fill-color: #15803d !important;
         text-decoration: underline !important;
         font-weight: 600 !important;
     }
@@ -545,34 +574,51 @@ st.markdown(
         padding: 1.25rem !important;
         margin-bottom: 1rem !important;
         color: #064e3b !important;
+        -webkit-text-fill-color: #064e3b !important;
         box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
     }
 
-    .tri-card * {
+    .tri-card,
+    .tri-card *,
+    .tri-card p,
+    .tri-card span,
+    .tri-card div,
+    .tri-card strong {
         color: #064e3b !important;
+        -webkit-text-fill-color: #064e3b !important;
     }
 
     .tri-card a {
         color: #047857 !important;
+        -webkit-text-fill-color: #047857 !important;
         text-decoration: underline !important;
         font-weight: 600 !important;
     }
 
-    .offer-card {
+    .offer-card,
+    .offer-card-new {
         background-color: #ffffff !important;
         border: 1px solid #e2e8f0 !important;
         border-radius: 10px !important;
         padding: 1.15rem !important;
         margin-bottom: 0.75rem !important;
         color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
         box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
     }
 
+    .offer-card *,
+    .offer-card-new *,
     .offer-card p,
+    .offer-card-new p,
     .offer-card div,
+    .offer-card-new div,
     .offer-card strong,
-    .offer-card span {
-        color: #0f172a;
+    .offer-card-new strong,
+    .offer-card span,
+    .offer-card-new span {
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
     }
 
     .notif-card {
@@ -582,6 +628,16 @@ st.markdown(
         padding: 0.9rem 1.1rem !important;
         margin-bottom: 0.6rem !important;
         color: #1e3a8a !important;
+        -webkit-text-fill-color: #1e3a8a !important;
+    }
+
+    .notif-card *,
+    .notif-card p,
+    .notif-card span,
+    .notif-card div,
+    .notif-card strong {
+        color: #1e3a8a !important;
+        -webkit-text-fill-color: #1e3a8a !important;
     }
 
     .step-card {
@@ -590,15 +646,20 @@ st.markdown(
         border-radius: 10px !important;
         padding: 1rem !important;
         min-height: 190px !important;
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
         box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
     }
 
+    .step-card *,
     .step-card strong {
         color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
     }
 
     .step-card p {
         color: #475569 !important;
+        -webkit-text-fill-color: #475569 !important;
     }
     </style>
     """,
