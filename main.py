@@ -382,9 +382,18 @@ app, rt = fast_app(
     live=False,
     secret_key=os.environ.get("SESSION_SECRET", "clé_secrete_session_permutstage"),
     hdrs=(
-        Title("PermutStage — Permutation de Stages Médecine"),
+        Title("PermutStage — Plateforme d'échange de stages de médecine"),
         Meta(charset="UTF-8"),
         Meta(name="viewport", content="width=device-width, initial-scale=1.0"),
+        Meta(name="description", content="Trouvez votre binôme de stage idéal en P3, P4, P5, P6, P7 ou P8 grâce à notre moteur de matching sécurisé."),
+        Meta(property="og:title", content="PermutStage — Échange de stages de médecine"),
+        Meta(property="og:description", content="Plateforme collaborative sécurisée de permutation de stages hospitaliers pour les étudiants en médecine."),
+        Meta(property="og:type", content="website"),
+        Meta(property="og:url", content="https://permutstage.onrender.com/"),
+        Meta(property="og:site_name", content="PermutStage"),
+        Meta(name="twitter:card", content="summary_large_image"),
+        Meta(name="twitter:title", content="PermutStage — Échange de stages de médecine"),
+        Meta(name="twitter:description", content="Plateforme collaborative sécurisée de permutation de stages hospitaliers pour les étudiants en médecine."),
         Link(rel="preconnect", href="https://fonts.googleapis.com"),
         Link(rel="preconnect", href="https://fonts.gstatic.com", crossorigin=""),
         Link(rel="stylesheet", href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"),
@@ -1849,6 +1858,7 @@ def render_header(session, active_tab="accueil", req: Request = None):
         )
 
     return Header(
+        Title("PermutStage — Plateforme d'échange de stages de médecine"),
         Div(
             Nav(
                 Ul(
