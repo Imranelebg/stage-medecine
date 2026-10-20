@@ -34,8 +34,6 @@ from firebase_admin import credentials, firestore
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PermutStage")
 
-SITE_TITLE = "PermutStage - Plateforme d'échange stages"
-
 # ---------------------------------------------------------------------------
 # 1. DESIGN SYSTEM & INITIALISATION DE L'APPLICATION FASTHTML (Pico.css)
 # ---------------------------------------------------------------------------
@@ -384,25 +382,22 @@ app, rt = fast_app(
     live=False,
     secret_key=os.environ.get("SESSION_SECRET", "clé_secrete_session_permutstage"),
     hdrs=(
-        Title(SITE_TITLE),
+        Title("PermutStage — Plateforme d'échange de stages de médecine"),
         Meta(charset="UTF-8"),
         Meta(name="viewport", content="width=device-width, initial-scale=1.0"),
-        Meta(name="application-name", content=SITE_TITLE),
-        Meta(name="apple-mobile-web-app-title", content=SITE_TITLE),
         Meta(name="description", content="Trouvez votre binôme de stage idéal en P3, P4, P5, P6, P7 ou P8 grâce à notre moteur de matching sécurisé."),
-        Meta(property="og:title", content=SITE_TITLE),
+        Meta(property="og:title", content="PermutStage — Échange de stages de médecine"),
         Meta(property="og:description", content="Plateforme collaborative sécurisée de permutation de stages hospitaliers pour les étudiants en médecine."),
         Meta(property="og:type", content="website"),
         Meta(property="og:url", content="https://permutstage.onrender.com/"),
-        Meta(property="og:site_name", content=SITE_TITLE),
+        Meta(property="og:site_name", content="PermutStage"),
         Meta(name="twitter:card", content="summary_large_image"),
-        Meta(name="twitter:title", content=SITE_TITLE),
+        Meta(name="twitter:title", content="PermutStage — Échange de stages de médecine"),
         Meta(name="twitter:description", content="Plateforme collaborative sécurisée de permutation de stages hospitaliers pour les étudiants en médecine."),
         Link(rel="preconnect", href="https://fonts.googleapis.com"),
         Link(rel="preconnect", href="https://fonts.gstatic.com", crossorigin=""),
         Link(rel="stylesheet", href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"),
         CUSTOM_STYLE,
-        Script(f"document.title = {json.dumps(SITE_TITLE)};"),
     ),
 )
 
@@ -1973,7 +1968,7 @@ def render_header(session, active_tab="accueil", req: Request = None):
         )
 
     return Header(
-        Title(SITE_TITLE),
+        Title("PermutStage — Plateforme d'échange de stages de médecine"),
         Div(
             Nav(
                 Ul(
@@ -2003,7 +1998,8 @@ def render_header(session, active_tab="accueil", req: Request = None):
 def render_footer():
     return Footer(
         Div(
-            P("Plateforme conçue et développée par ", Strong("Imrane Machbaête"), " — Version Alpha"),
+            P("Plateforme collaborative de permutation de stages hospitaliers · Promotion Médecine 2028 · FastHTML & Firebase Firestore"),
+            Small("Données réelles synchronisées et persistées dans Google Cloud Firestore (Collections: users, demandes, discussions, messages)"),
             A("🔒 Accès Administrateur", href="/admin-login-view", style="display:block; margin-top:0.5rem; font-size:0.75rem; color:#94a3b8; text-decoration:none;"),
             style="text-align: center; color: #64748b; font-size: 0.82rem; padding: 2rem 0 1rem 0;"
         ),
@@ -2041,21 +2037,21 @@ def get(session, req: Request = None):
         print(f"[PermutStage] Erreur matching triangulaire accueil: {exc}")
         all_tri = []
 
-    return Title(SITE_TITLE), Main(
+    return Main(
         render_header(session, "accueil", req),
         Div(
             Div(
                 Div("✨ PROMOTION MÉDECINE 2028 · MASTER 2", cls="hero-badge"),
                 H1("Trouvez votre binôme de stage idéal en quelques clics", style="font-size:2.1rem; font-weight:800;"),
                 P(
-                    "Bienvenue sur ",
-                    Strong("PermutStage"),
-                    ", la plateforme conçue spécialement pour faciliter et fluidifier les permutations de lieux de stages hospitaliers entre camarades de promotion. Fini les listes dispersées et les messages perdus : vos souhaits sont analysés intelligemment en toute confidentialité.",style="font-size:1.05rem; opacity:0.95; line-height:1.6;"
+                    "Bienvenue sur PermutStage, l'application pensée pour fluidifier, simplifier et centraliser les échanges de lieux de stages hospitaliers. "
+                    "Vos souhaits sont analysés en temps réel par notre algorithme de permutation, avec persistance garantie sur Google Cloud Firestore.",
+                    style="font-size:1.05rem; opacity:0.95; line-height:1.6;"
                 ),
                 Div(
-                    Strong("🤝 Statut du projet : Version Alpha / Concept Test (des bugs peuvent exister"), style="color: #fbbf24;"),
+                    Strong("🤝 Statut du projet : Version Alpha / Concept Test"),
                     Br(),
-                    "Cette application est un concept test expérimental développé bénévolement pour les étudiants afin de centraliser et d'accélérer les échanges avant la remise des fiches officielles. Vos retours constructifs et votre bienveillance sont les bienvenus pour améliorer l'outil au service de toute la promotion !",
+                    "Cette plateforme est une initiative bénévole conçue par et pour les étudiants. Seules les personnes directement impliquées dans un échange ont accès à leurs coordonnées réciproques.",
                     cls="hero-alpha-box"
                 ),
                 cls="hero-banner"
@@ -2073,7 +2069,7 @@ def get(session, req: Request = None):
             Div(
                 Article(
                     Strong("1. Créer son profil"),
-                    P("Nom, prénom, email institutionnel et code PIN à 4 chiffres. Votre compte persiste dans la base de données.", style="font-size:0.85rem; color:#475569; margin-top:0.35rem;"),
+                    P("Nom, prénom, email institutionnel et code PIN à 4 chiffres. Votre compte persiste dans Firestore.", style="font-size:0.85rem; color:#475569; margin-top:0.35rem;"),
                 ),
                 Article(
                     Strong("2. Déposer son offre"),
@@ -2119,7 +2115,7 @@ def get(session, req: Request = None):
 def get(session, req: Request = None):
     u = get_session_user(session, req)
     if not u or not u.get("email"):
-        return Title(SITE_TITLE), Main(
+        return Main(
             render_header(session, "deposer", req),
             Div(
                 Article(
@@ -2137,11 +2133,11 @@ def get(session, req: Request = None):
     user_nom = f"{u.get('prenom', '')} {u.get('nom', '')}".strip() or user_email
     default_actuel = TOUS_LES_HOPITAUX[0]
 
-    return Title(SITE_TITLE), Main(
+    return Main(
         render_header(session, "deposer", req),
         Div(
             H2("Déposer une nouvelle offre de permutation", style="font-weight:800; color:#0f172a;"),
-            P("Vos coordonnées sont automatiquement verrouillées sur votre profil étudiant connecté. L'offre sera enregistrée dans la base de données et analysée en temps réel."),
+            P("Vos coordonnées sont automatiquement verrouillées sur votre profil étudiant connecté. L'offre sera enregistrée dans Firestore et analysée en temps réel."),
             Div(id="depot-feedback"),
             Form(
                 Div(
@@ -2270,7 +2266,7 @@ async def post(session, req: Request = None, periode: str = "", specialite: str 
 def get(session, req: Request = None):
     u = get_session_user(session, req)
     if not u or not u.get("email"):
-        return Title(SITE_TITLE), Main(
+        return Main(
             render_header(session, "matchs", req),
             Div(
                 Article(
@@ -2516,7 +2512,7 @@ def get(session, req: Request = None):
                 )
             )
 
-    return Title(SITE_TITLE), Main(
+    return Main(
         render_header(session, "matchs", req),
         Div(
             H2("Mes correspondances privées & Salons de discussion", style="font-weight:800; color:#0f172a;"),
@@ -2594,7 +2590,7 @@ def get(session, id: str, req: Request = None):
             id=f"accord-section-{slugify(disc_id)}"
         )
 
-    return Title(SITE_TITLE), Main(
+    return Main(
         render_header(session, "matchs", req),
         Div(
             A("← Retour à Mes Matchs", href="/matchs", style="display:inline-block; margin-bottom:1rem; font-size:0.9rem; font-weight:600;"),
@@ -2749,7 +2745,7 @@ def get(session, f_periode: str = "Toutes", f_specialite: str = "Toutes", f_regi
         action="/catalogue"
     )
 
-    return Title(SITE_TITLE), Main(
+    return Main(
         render_header(session, "catalogue", req),
         Div(
             H2(f"Catalogue des offres de stage disponibles ({len(df_filtre)} affichée(s))", style="font-weight:800; color:#0f172a;"),
@@ -2766,7 +2762,7 @@ def get(session, f_periode: str = "Toutes", f_specialite: str = "Toutes", f_regi
 def get(session, req: Request = None):
     u = get_session_user(session, req)
     if not u or not u.get("email"):
-        return Title(SITE_TITLE), Main(
+        return Main(
             render_header(session, "gerer", req),
             Div(
                 Article(
@@ -2861,7 +2857,7 @@ def get(session, req: Request = None):
                 )
             )
 
-    return Title(SITE_TITLE), Main(
+    return Main(
         render_header(session, "gerer", req),
         Div(
             H2("Gérer mes annonces publiées", style="font-weight:800; color:#0f172a;"),
@@ -2939,7 +2935,7 @@ def get(session, req: Request = None):
     if u and u.get("email"):
         return RedirectResponse("/deposer")
 
-    return Title(SITE_TITLE), Main(
+    return Main(
         render_header(session, "accueil", req),
         Div(
             Div(
@@ -3223,7 +3219,7 @@ def get(session):
 
 @rt("/forgot-pin-view")
 def get(session, req: Request = None):
-    return Title(SITE_TITLE), Main(
+    return Main(
         render_header(session, "accueil", req),
         Div(
             Article(
@@ -3373,7 +3369,7 @@ def get(session, req: Request = None):
                 )
             )
 
-    return Title(SITE_TITLE), Main(
+    return Main(
         render_header(session, "profil", req),
         Div(
             H2("👤 Mon Profil Étudiant", style="font-weight:800; color:#0f172a; margin-bottom:0.4rem;"),
@@ -3525,7 +3521,7 @@ def get(session, req: Request = None):
                 )
             )
 
-    return Title(SITE_TITLE), Main(
+    return Main(
         render_header(session, "accueil", req),
         Div(
             H2("🔔 Centre de Notifications", style="font-weight:800; color:#0f172a;"),
@@ -3538,7 +3534,7 @@ def get(session, req: Request = None):
 @rt("/logout")
 def get(session):
     session.clear()
-    return Title(SITE_TITLE), Main(
+    return Main(
         Script("""
             localStorage.removeItem('permutstage_auth_email');
             sessionStorage.setItem('permutstage_logged_out', '1');
@@ -3558,7 +3554,7 @@ def get(session):
 # === VUE 6 : ESPACE ADMINISTRATION ===
 @rt("/admin-login-view")
 def get(session, req: Request = None):
-    return Title(SITE_TITLE), Main(
+    return Main(
         render_header(session, "accueil", req),
         Div(
             Article(
@@ -3646,7 +3642,7 @@ def get(session, req: Request = None):
             )
         )
 
-    return Title(SITE_TITLE), Main(
+    return Main(
         render_header(session, "admin", req),
         Div(
             H2("🛠️ Espace Administrateur (Supervision globale)", style="font-weight:800; color:#0f172a;"),
