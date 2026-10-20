@@ -527,7 +527,7 @@ def build_discussion_id(type_match: str, participants: list[str]) -> str:
 # 3. INITIALISATION GOOGLE CLOUD FIREBASE FIRESTORE & PERSISTANCE GARANTIE
 # ---------------------------------------------------------------------------
 _FIRESTORE_CLIENT = None
-_FIRESTORE_INIT_DONE = False
+_FIRESTORE_LAST_ATTEMPT = 0.0
 LOCAL_DB_FILE = os.path.join(os.path.dirname(__file__), ".permutstage_local_db.json")
 
 def load_local_db() -> dict:
@@ -549,115 +549,128 @@ def save_local_db(data: dict):
         print(f"[PermutStage] Erreur sauvegarde locale: {exc}")
 
 def get_firestore_client():
-    """Initialise Firebase Firestore une seule fois sans jamais bloquer 20s sur Render."""
-    global _FIRESTORE_CLIENT, _FIRESTORE_INIT_DONE
+    """Initialise Firebase Firestore avec détection automatique sur Render."""
+    global _FIRESTORE_CLIENT, _FIRESTORE_LAST_ATTEMPT
     if _FIRESTORE_CLIENT is not None:
         return _FIRESTORE_CLIENT
-    if _FIRESTORE_INIT_DONE:
-        return None
 
-    _FIRESTORE_INIT_DONE = True
-
-    if not firebase_admin._apps:
+    # Si déjà initialisé dans firebase_admin
+    if firebase_admin._apps:
         try:
-            fb_creds_dict = None
+            _FIRESTORE_CLIENT = firestore.client()
+            return _FIRESTORE_CLIENT
+        except Exception:
+            pass
 
-            # 1. Variables d'environnement (JSON direct ou chemin de fichier)
-            env_var_names = [
-                "FIREBASE_CREDENTIALS", "FIREBASE_CONFIG", "FIREBASE_KEY",
-                "FIREBASE_SERVICE_ACCOUNT", "FIREBASE_CREDENTIALS_JSON",
-                "FIREBASE_KEY_JSON", "FIREBASE_JSON", "FIREBASE_SECRET",
-                "FIREBASE_ADMIN_CREDENTIALS", "GOOGLE_APPLICATION_CREDENTIALS",
-                "GOOGLE_CREDENTIALS", "SERVICE_ACCOUNT"
-            ]
-            for env_key in env_var_names:
-                raw_env = os.environ.get(env_key)
-                if raw_env:
-                    raw_env = raw_env.strip()
-                    # Supprimer d'éventuels guillemets englobants
-                    if (raw_env.startswith("'") and raw_env.endswith("'")) or (raw_env.startswith('"') and raw_env.endswith('"')):
-                        raw_env = raw_env[1:-1].strip()
+    # Éviter de retenter plus d'une fois toutes les 5 secondes si pas de clé
+    now = time.time()
+    if now - _FIRESTORE_LAST_ATTEMPT < 5.0:
+        return None
+    _FIRESTORE_LAST_ATTEMPT = now
 
-                    if os.path.exists(raw_env):
+    try:
+        fb_creds_dict = None
+
+        # 1. Variables d'environnement (JSON direct ou chemin de fichier)
+        env_var_names = [
+            "FIREBASE_CREDENTIALS", "FIREBASE_CONFIG", "FIREBASE_KEY",
+            "FIREBASE_SERVICE_ACCOUNT", "FIREBASE_CREDENTIALS_JSON",
+            "FIREBASE_KEY_JSON", "FIREBASE_JSON", "FIREBASE_SECRET",
+            "FIREBASE_ADMIN_CREDENTIALS", "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_CREDENTIALS", "SERVICE_ACCOUNT"
+        ]
+        
+        detected_env = [k for k in env_var_names if os.environ.get(k)]
+        if detected_env:
+            print(f"[PermutStage] Variables Firebase détectées dans l'environnement : {detected_env}")
+
+        for env_key in env_var_names:
+            raw_env = os.environ.get(env_key)
+            if raw_env:
+                raw_env = raw_env.strip()
+                # Supprimer d'éventuels guillemets englobants
+                if (raw_env.startswith("'") and raw_env.endswith("'")) or (raw_env.startswith('"') and raw_env.endswith('"')):
+                    raw_env = raw_env[1:-1].strip()
+
+                if os.path.exists(raw_env):
+                    try:
+                        cred = credentials.Certificate(raw_env)
+                        firebase_admin.initialize_app(cred)
+                        _FIRESTORE_CLIENT = firestore.client()
+                        print(f"[PermutStage] ✅ Firestore initialisé depuis fichier chemin env {env_key}: {raw_env}")
+                        return _FIRESTORE_CLIENT
+                    except Exception as e_cert:
+                        print(f"[PermutStage] ❌ Erreur chargement certificat depuis {raw_env}: {e_cert}")
+                else:
+                    try:
+                        fb_creds_dict = json.loads(raw_env)
+                        print(f"[PermutStage] ✅ JSON de configuration Firebase parsé depuis variable {env_key}")
+                        break
+                    except Exception as json_err:
+                        print(f"[PermutStage] ⚠️ Variable {env_key} présente mais échec du parsing JSON : {json_err}")
+
+        # 2. Fichiers secrets.toml
+        if fb_creds_dict is None:
+            for p in [os.path.join(os.path.dirname(__file__), ".streamlit", "secrets.toml"), "secrets.toml"]:
+                if os.path.exists(p):
+                    try:
+                        import tomllib
+                    except ImportError:
                         try:
-                            cred = credentials.Certificate(raw_env)
-                            firebase_admin.initialize_app(cred)
-                            _FIRESTORE_CLIENT = firestore.client()
-                            print(f"[PermutStage] Firestore initialisé depuis fichier env {env_key}: {raw_env}")
-                            return _FIRESTORE_CLIENT
-                        except Exception as e_cert:
-                            print(f"[PermutStage] Erreur chargement certificat depuis {raw_env}: {e_cert}")
-                    else:
+                            import tomli as tomllib
+                        except ImportError:
+                            tomllib = None
+                    if tomllib:
                         try:
-                            fb_creds_dict = json.loads(raw_env)
-                            print(f"[PermutStage] JSON de configuration Firebase détecté dans variable {env_key}")
-                            break
+                            with open(p, "rb") as f:
+                                sec = tomllib.load(f)
+                                if "firebase" in sec:
+                                    fb_creds_dict = dict(sec["firebase"])
+                                    print(f"[PermutStage] ✅ Configuration Firebase trouvée dans {p}")
+                                    break
                         except Exception:
                             pass
 
-            # 2. Fichiers secrets.toml
-            if fb_creds_dict is None:
-                for p in [os.path.join(os.path.dirname(__file__), ".streamlit", "secrets.toml"), "secrets.toml"]:
-                    if os.path.exists(p):
-                        try:
-                            import tomllib
-                        except ImportError:
-                            try:
-                                import tomli as tomllib
-                            except ImportError:
-                                tomllib = None
-                        if tomllib:
-                            try:
-                                with open(p, "rb") as f:
-                                    sec = tomllib.load(f)
-                                    if "firebase" in sec:
-                                        fb_creds_dict = dict(sec["firebase"])
-                                        print(f"[PermutStage] Configuration Firebase trouvée dans {p}")
-                                        break
-                            except Exception:
-                                pass
+        # 3. Fichiers JSON (racine du projet ou dossier /etc/secrets/ de Render)
+        if fb_creds_dict is None:
+            json_candidates = [
+                "serviceAccountKey.json", "firebase_key.json", "firebase-credentials.json", "firebase_credentials.json", "firebase.json",
+                "/etc/secrets/serviceAccountKey.json", "/etc/secrets/firebase_key.json", "/etc/secrets/firebase-credentials.json", "/etc/secrets/firebase_credentials.json", "/etc/secrets/firebase.json"
+            ]
+            if os.path.exists("/etc/secrets"):
+                try:
+                    for sf in os.listdir("/etc/secrets"):
+                        if sf.endswith(".json"):
+                            json_candidates.append(os.path.join("/etc/secrets", sf))
+                except Exception:
+                    pass
 
-            # 3. Fichiers JSON (racine du projet ou dossier /etc/secrets/ de Render)
-            if fb_creds_dict is None:
-                json_candidates = [
-                    "serviceAccountKey.json", "firebase_key.json", "firebase-credentials.json", "firebase_credentials.json", "firebase.json",
-                    "/etc/secrets/serviceAccountKey.json", "/etc/secrets/firebase_key.json", "/etc/secrets/firebase-credentials.json", "/etc/secrets/firebase_credentials.json", "/etc/secrets/firebase.json"
-                ]
-                # Détection automatique de tout fichier JSON dans /etc/secrets
-                if os.path.exists("/etc/secrets"):
+            for p in json_candidates:
+                if os.path.exists(p):
                     try:
-                        for sf in os.listdir("/etc/secrets"):
-                            if sf.endswith(".json"):
-                                json_candidates.append(os.path.join("/etc/secrets", sf))
-                    except Exception:
-                        pass
+                        cred = credentials.Certificate(p)
+                        firebase_admin.initialize_app(cred)
+                        _FIRESTORE_CLIENT = firestore.client()
+                        print(f"[PermutStage] ✅ Firestore initialisé depuis fichier JSON : {p}")
+                        return _FIRESTORE_CLIENT
+                    except Exception as e_cert:
+                        print(f"[PermutStage] ❌ Erreur lecture certificat {p}: {e_cert}")
 
-                for p in json_candidates:
-                    if os.path.exists(p):
-                        try:
-                            cred = credentials.Certificate(p)
-                            firebase_admin.initialize_app(cred)
-                            _FIRESTORE_CLIENT = firestore.client()
-                            print(f"[PermutStage] Firestore initialisé depuis fichier JSON : {p}")
-                            return _FIRESTORE_CLIENT
-                        except Exception as e_cert:
-                            print(f"[PermutStage] Erreur fichier {p}: {e_cert}")
+        if fb_creds_dict:
+            if "private_key" in fb_creds_dict and isinstance(fb_creds_dict["private_key"], str):
+                fb_creds_dict["private_key"] = fb_creds_dict["private_key"].replace("\\n", "\n")
+            cred = credentials.Certificate(fb_creds_dict)
+            firebase_admin.initialize_app(cred)
+            _FIRESTORE_CLIENT = firestore.client()
+            print("[PermutStage] ✅ Firestore initialisé avec succès depuis dictionnaire credentials !")
+            return _FIRESTORE_CLIENT
 
-            if fb_creds_dict:
-                if "private_key" in fb_creds_dict and isinstance(fb_creds_dict["private_key"], str):
-                    fb_creds_dict["private_key"] = fb_creds_dict["private_key"].replace("\\n", "\n")
-                cred = credentials.Certificate(fb_creds_dict)
-                firebase_admin.initialize_app(cred)
-                _FIRESTORE_CLIENT = firestore.client()
-                print("[PermutStage] Firestore initialisé avec succès depuis le dictionnaire de credentials !")
-                return _FIRESTORE_CLIENT
+        print("[PermutStage] ℹ️ Aucune clé Firebase valide détectée (Variables d'environnement ou fichiers secrets). Mode local activé.")
+        return None
 
-            # Aucun appel à firebase_admin.initialize_app() vide pour éviter le timeout de 20s sur Render
-            return None
-
-        except Exception as exc:
-            print(f"[PermutStage] Firestore init notice: {exc}")
-            return None
+    except Exception as exc:
+        print(f"[PermutStage] ❌ Firestore init exception: {exc}")
+        return None
 
     try:
         _FIRESTORE_CLIENT = firestore.client()
@@ -749,19 +762,24 @@ def create_or_update_user(user_data: dict) -> bool:
 
     # 1. Écriture Firestore
     db = get_firestore_client()
+    firestore_written = False
     if db is not None:
         try:
             db.collection(COLLECTION_USERS).document(clean_email).set(doc_payload)
-            print(f"[PermutStage] Succès écriture Firestore user: {clean_email}")
+            print(f"[PermutStage Inscription] ✅ Document écrit avec succès dans Firestore : collection '{COLLECTION_USERS}', id '{clean_email}'")
+            firestore_written = True
         except Exception as exc:
-            print(f"[PermutStage] Erreur écriture Firestore user: {exc}")
-            logger.error(f"[PermutStage] Erreur écriture Firestore user: {exc}")
+            print(f"[PermutStage Inscription] ❌ ÉCHEC écriture Firestore pour '{clean_email}': {exc}")
+            logger.error(f"[PermutStage Inscription] Erreur Firestore: {exc}", exc_info=True)
+    else:
+        print(f"[PermutStage Inscription] ⚠️ Client Firestore non initialisé. Écriture dans base de secours locale uniquement.")
 
     # 2. Écriture persistante sur disque local
     local = load_local_db()
     if "users" not in local: local["users"] = {}
     local["users"][clean_email] = doc_payload
     save_local_db(local)
+    print(f"[PermutStage Inscription] ✅ Compte enregistré dans la base locale persistante.")
 
     # Invalidation du cache mémoire
     invalidate_cache("users")
@@ -2736,13 +2754,17 @@ async def inscription_route(session, req: Request):
     clean_email = str(form_data.get("email", "")).strip().lower()
     clean_pin = normalize_pin(str(form_data.get("pin", "") or form_data.get("code_pin", "")).strip())
 
+    print(f"[PermutStage Inscription] 📩 Requête POST reçue : prenom='{clean_prenom}', nom='{clean_nom}', email='{clean_email}'")
+
     # 1. Validation assouplie : Prénom et Nom dès 1 caractère
     if len(clean_prenom) < 1:
+        print("[PermutStage Inscription] ⚠️ Échec validation : prénom vide")
         return Article(
             P("⚠️ Veuillez renseigner votre prénom (au moins 1 caractère).", style="color:#b91c1c; font-weight:600; margin:0;"),
             style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
         )
     if len(clean_nom) < 1:
+        print("[PermutStage Inscription] ⚠️ Échec validation : nom vide")
         return Article(
             P("⚠️ Veuillez renseigner votre nom (au moins 1 caractère).", style="color:#b91c1c; font-weight:600; margin:0;"),
             style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
@@ -2750,6 +2772,7 @@ async def inscription_route(session, req: Request):
 
     # 2. Validation assouplie : Email avec @ et un domaine avec point
     if not clean_email or "@" not in clean_email or "." not in clean_email.split("@")[-1]:
+        print(f"[PermutStage Inscription] ⚠️ Échec validation email invalide : {clean_email}")
         return Article(
             P("⚠️ Format d'adresse email invalide. Veuillez saisir une adresse universitaire valide contenant '@' et un nom de domaine.", style="color:#b91c1c; font-weight:600; margin:0;"),
             style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
@@ -2757,6 +2780,7 @@ async def inscription_route(session, req: Request):
 
     # 3. Validation assouplie : Code PIN de 4 chiffres
     if not clean_pin or len(clean_pin) != 4 or not clean_pin.isdigit():
+        print(f"[PermutStage Inscription] ⚠️ Échec validation code PIN invalide : {clean_pin}")
         return Article(
             P("⚠️ Le code PIN doit comporter exactement 4 chiffres numériques (ex: 1234).", style="color:#b91c1c; font-weight:600; margin:0;"),
             style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
@@ -2766,6 +2790,7 @@ async def inscription_route(session, req: Request):
     try:
         existing = get_user_by_email(clean_email)
         if existing:
+            print(f"[PermutStage Inscription] ⚠️ Compte déjà existant pour l'email : {clean_email}")
             return Article(
                 P("⚠️ Un compte existe déjà avec cette adresse email. Veuillez vous connecter.", style="color:#b91c1c; font-weight:700; margin:0;"),
                 P("Votre profil est déjà enregistré dans Firestore. Utilisez le formulaire de connexion ci-contre.", style="font-size:0.85rem; color:#64748b; margin-top:0.35rem;"),
