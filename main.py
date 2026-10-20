@@ -1190,10 +1190,22 @@ def envoyer_message(discussion_id: str, sender_email: str, sender_name: str, tex
     """
     Insère un message dans Firestore (collection 'messages')
     et met à jour la discussion parente (collection 'discussions') avec statut 'en discussion' automatique.
+    Si c'est le TOUT PREMIER message du salon, notifie par email les autres participants.
     """
     clean_text = texte.strip()
     if not clean_text:
         return False
+
+    clean_sender_email = sender_email.strip().lower()
+    clean_sender_name = sender_name.strip() or clean_sender_email
+
+    # 1. Vérifier si c'est le tout premier message du salon (historique vide avant cet envoi)
+    is_first_message = False
+    try:
+        prev_messages = recuperer_messages(discussion_id)
+        is_first_message = (len(prev_messages) == 0)
+    except Exception as exc:
+        logger.warning(f"[PermutStage] Vérification premier message échouée: {exc}")
 
     msg_id = f"MSG_{uuid.uuid4().hex[:10].upper()}"
     now_iso = datetime.now().isoformat()
@@ -1204,10 +1216,10 @@ def envoyer_message(discussion_id: str, sender_email: str, sender_name: str, tex
         "Message_ID": msg_id,
         "discussion_id": discussion_id,
         "Room_ID": discussion_id,
-        "sender_email": sender_email.strip().lower(),
-        "Sender_Email": sender_email.strip().lower(),
-        "sender_name": sender_name.strip(),
-        "Sender_Name": sender_name.strip(),
+        "sender_email": clean_sender_email,
+        "Sender_Email": clean_sender_email,
+        "sender_name": clean_sender_name,
+        "Sender_Name": clean_sender_name,
         "texte": clean_text,
         "Texte": clean_text,
         "timestamp": now_iso,
@@ -1240,6 +1252,14 @@ def envoyer_message(discussion_id: str, sender_email: str, sender_name: str, tex
         if local["discussions"][discussion_id].get("statut") != "accord trouvé":
             local["discussions"][discussion_id]["statut"] = "en discussion"
     save_local_db(local)
+
+    # 2. Si premier message, notifier par email uniquement les autres participants
+    if is_first_message:
+        try:
+            send_first_message_notification(discussion_id, clean_sender_email, clean_sender_name, clean_text)
+        except Exception as exc:
+            logger.warning(f"[PermutStage] Erreur envoi alerte premier message: {exc}")
+
     return True
 
 def recuperer_messages(discussion_id: str) -> list[dict]:
@@ -1482,24 +1502,157 @@ def build_user_notifications(
     return notifs
 
 # ---------------------------------------------------------------------------
-# 8. ENVOI DES EMAILS D'ALERTE SMTP
+# 8. ENVOI DES EMAILS D'ALERTE SMTP & NOTIFICATIONS AUTOMATIQUES
 # ---------------------------------------------------------------------------
 def get_smtp_config():
-    server = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
-    port = int(os.environ.get("SMTP_PORT", 587))
-    user = os.environ.get("SMTP_USERNAME", "")
-    password = os.environ.get("SMTP_PASSWORD", "")
+    """
+    Récupère la configuration SMTP depuis les variables d'environnement (Render)
+    ou depuis les fichiers secrets locaux de secours.
+    Variables d'environnement requises : SMTP_USERNAME et SMTP_PASSWORD.
+    """
+    server = os.environ.get("SMTP_SERVER", "smtp.gmail.com").strip()
+    try:
+        port = int(os.environ.get("SMTP_PORT", 587))
+    except (ValueError, TypeError):
+        port = 587
+    user = os.environ.get("SMTP_USERNAME", "").strip()
+    password = os.environ.get("SMTP_PASSWORD", "").strip()
+
+    if not user or not password:
+        # Repli de secours : vérification des fichiers secrets.toml si présents
+        for p in [os.path.join(os.path.dirname(__file__), ".streamlit", "secrets.toml"), "secrets.toml"]:
+            if os.path.exists(p):
+                try:
+                    try:
+                        import tomllib
+                    except ImportError:
+                        try:
+                            import tomli as tomllib
+                        except ImportError:
+                            tomllib = None
+                    if tomllib:
+                        with open(p, "rb") as f:
+                            sec = tomllib.load(f)
+                            if "smtp" in sec:
+                                s_dict = sec["smtp"]
+                                user = user or str(s_dict.get("username") or s_dict.get("user") or "").strip()
+                                password = password or str(s_dict.get("password") or "").strip()
+                                server = str(s_dict.get("server", server)).strip()
+                                try:
+                                    port = int(s_dict.get("port", port))
+                                except Exception:
+                                    pass
+                                break
+                except Exception:
+                    pass
+
     if not user or not password:
         return None
     return server, port, user, password
+
+def _send_email_smtp(dest_email: str, subject: str, body: str) -> bool:
+    """
+    Envoie un email via SMTP en gérant TLS (port 587) et SSL (port 465).
+    Protégé par try/except pour garantir qu'aucune exception réseau ne bloque l'application.
+    """
+    clean_dest = str(dest_email or "").strip().lower()
+    if not clean_dest or "@" not in clean_dest:
+        return False
+
+    smtp_cfg = get_smtp_config()
+    if not smtp_cfg:
+        logger.info(f"[PermutStage SMTP] Email non envoyé à {clean_dest} : SMTP non configuré.")
+        return False
+
+    smtp_server, smtp_port, smtp_user, smtp_password = smtp_cfg
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = smtp_user
+    msg["To"] = clean_dest
+
+    try:
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=12) as server:
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_server, smtp_port, timeout=12) as server:
+                server.ehlo()
+                if smtp_port in (587, 25):
+                    server.starttls()
+                    server.ehlo()
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        logger.info(f"[PermutStage SMTP] ✅ Email envoyé avec succès à {clean_dest} (Objet: '{subject}')")
+        return True
+    except Exception as exc:
+        logger.warning(f"[PermutStage SMTP] ⚠️ Erreur lors de l'envoi email à {clean_dest}: {exc}")
+        return False
+
+def send_welcome_email(dest_email: str, prenom: str, nom: str, pin: str) -> bool:
+    """
+    Envoie un email de bienvenue automatique à l'étudiant dès la validation de son compte.
+    Rappelle son prénom, son nom, son identifiant email et son code PIN confidentiel à 4 chiffres.
+    """
+    try:
+        clean_prenom = str(prenom or "").strip() or "étudiant(e)"
+        clean_nom = str(nom or "").strip()
+        clean_pin = normalize_pin(pin)
+        clean_email = str(dest_email or "").strip().lower()
+        sujet = "[PermutStage] Confirmation de votre inscription & Vos identifiants"
+        corps = (
+            f"Bonjour {clean_prenom} {clean_nom},\n\n"
+            f"Bienvenue sur PermutStage, la plateforme sécurisée de permutation de stages hospitaliers !\n\n"
+            f"Votre compte étudiant a été créé avec succès. Voici le récapitulatif de vos identifiants confidentiels de connexion :\n\n"
+            f"• Identifiant (email institutionnel) : {clean_email}\n"
+            f"• Prénom & Nom : {clean_prenom} {clean_nom}\n"
+            f"• Code PIN confidentiel (4 chiffres) : {clean_pin}\n\n"
+            f"Vous pouvez vous connecter dès à présent pour déposer vos offres de stage et découvrir vos correspondances :\n"
+            f"👉 Connexion : https://permutstage.onrender.com/login-view\n\n"
+            f"💡 Vous pourrez modifier votre code PIN à tout instant depuis votre profil en haut à droite une fois connecté(e).\n\n"
+            f"Bien cordialement,\n"
+            f"L'équipe PermutStage"
+        )
+        return _send_email_smtp(clean_email, sujet, corps)
+    except Exception as exc:
+        logger.warning(f"[PermutStage] Erreur send_welcome_email: {exc}")
+        return False
+
+def send_pin_recovery_email(dest_email: str, prenom: str, pin: str) -> bool:
+    """
+    Envoie le code PIN par email de façon sécurisée à l'adresse institutionnelle de l'étudiant.
+    """
+    try:
+        pin_formatte = normalize_pin(pin)
+        prenom_clean = str(prenom or "collègue").strip()
+        sujet = "[PermutStage] Récupération de votre code PIN"
+        corps = (
+            f"Bonjour {prenom_clean},\n\n"
+            f"Vous avez demandé la récupération de votre code PIN pour accéder à PermutStage.\n\n"
+            f"Votre code PIN de connexion est : {pin_formatte}\n\n"
+            f"Vous pouvez désormais vous connecter directement sur la plateforme avec votre adresse étudiante et ce code PIN :\n"
+            f"👉 Connexion : https://permutstage.onrender.com/login-view\n\n"
+            f"💡 Pour votre sécurité, vous pouvez modifier votre code PIN à tout moment depuis le menu profil en haut à droite après connexion.\n\n"
+            f"Si vous n'êtes pas à l'origine de cette demande, vous pouvez ignorer cet email.\n\n"
+            f"L'équipe PermutStage"
+        )
+        return _send_email_smtp(dest_email, sujet, corps)
+    except Exception as exc:
+        logger.warning(f"[PermutStage] Erreur send_pin_recovery_email: {exc}")
+        return False
 
 def send_match_notification_emails(
     participants: list[dict],
     periode: str,
     specialite: str,
     room_id: str,
-    df_utilisateurs: pd.DataFrame,
+    df_utilisateurs: pd.DataFrame = None,
 ) -> int:
+    """
+    Alerte individuellement chaque participant d'un match (bilatéral A <-> B ou cycle triangulaire A -> B -> C -> A)
+    avec la spécialité, la période et le lien vers leur salon privé.
+    Système anti-doublon NOTIFIED_MATCH_ROOMS pour éviter tout spam.
+    """
     global NOTIFIED_MATCH_ROOMS
     if room_id in NOTIFIED_MATCH_ROOMS:
         return 0
@@ -1509,75 +1662,102 @@ def send_match_notification_emails(
         NOTIFIED_MATCH_ROOMS.add(room_id)
         return 0
 
-    smtp_server, smtp_port, smtp_user, smtp_password = smtp_cfg
-    sujet = "[PermutStage] Un échange de stage est disponible pour vous !"
     sent_count = 0
     seen_dest = set()
+    sujet = f"[PermutStage] Correspondance trouvée pour votre stage de {specialite} ({periode}) !"
 
     try:
-        with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as server:
-            server.ehlo()
-            if smtp_port in (587, 25):
-                server.starttls()
-                server.ehlo()
-            server.login(smtp_user, smtp_password)
+        for p in participants:
+            dest_email = str(p.get("Email") or p.get("user_email") or p.get("email") or "").strip().lower()
+            if not dest_email or dest_email in seen_dest:
+                continue
+            seen_dest.add(dest_email)
 
-            for p in participants:
-                dest_email = str(p.get("Email") or p.get("user_email") or "").strip().lower()
-                if not dest_email or dest_email in seen_dest:
-                    continue
-                seen_dest.add(dest_email)
-
-                nom = str(p.get("Nom") or p.get("nom_etudiant") or "Étudiant(e)").strip()
-                corps = (
-                    f"Bonjour {nom},\\n\\n"
-                    f"Une opportunité d'échange direct vient de se former pour votre stage de {specialite} ({periode}) !\\n\\n"
-                    f"Un salon de discussion privé et sécurisé a été ouvert sur PermutStage. Connectez-vous dès maintenant avec votre adresse étudiante et votre code PIN pour finaliser l'accord.\\n\\n"
-                    f"À très vite,\\n"
-                    f"L'équipe PermutStage"
-                )
-                try:
-                    msg = MIMEText(corps, "plain", "utf-8")
-                    msg["Subject"] = sujet
-                    msg["From"] = smtp_user
-                    msg["To"] = dest_email
-                    server.send_message(msg)
+            nom = str(p.get("Nom") or p.get("nom_etudiant") or p.get("prenom") or "Étudiant(e)").strip()
+            corps = (
+                f"Bonjour {nom},\n\n"
+                f"Bonne nouvelle ! Une opportunité d'échange de stage vient de se former sur PermutStage pour votre stage de {specialite} (période {periode}).\n\n"
+                f"Un salon de discussion privé et sécurisé a été automatiquement créé pour échanger avec vos correspondants :\n"
+                f"👉 Accéder à votre salon privé : https://permutstage.onrender.com/salon/{room_id}\n\n"
+                f"Connectez-vous dès à présent avec votre adresse institutionnelle et votre code PIN pour débuter la discussion et valider votre accord.\n\n"
+                f"À très vite sur PermutStage,\n"
+                f"L'équipe PermutStage"
+            )
+            try:
+                if _send_email_smtp(dest_email, sujet, corps):
                     sent_count += 1
-                except Exception:
-                    continue
+            except Exception as mail_err:
+                logger.warning(f"[PermutStage] Erreur envoi mail match à {dest_email}: {mail_err}")
 
         NOTIFIED_MATCH_ROOMS.add(room_id)
         return sent_count
     except Exception as exc:
-        print(f"[PermutStage] Erreur SMTP match alert: {exc}")
+        logger.warning(f"[PermutStage] Erreur générale send_match_notification_emails: {exc}")
+        NOTIFIED_MATCH_ROOMS.add(room_id)
         return sent_count
 
-def send_pin_recovery_email(dest_email: str, prenom: str, pin: str) -> bool:
-    smtp_cfg = get_smtp_config()
-    if not smtp_cfg:
-        raise RuntimeError("SMTP non configuré. Veuillez définir SMTP_USERNAME et SMTP_PASSWORD.")
+def get_discussion_participant_emails(discussion_id: str) -> list[str]:
+    """Extrait la liste des adresses email des participants d'un salon de discussion."""
+    emails = []
+    try:
+        disc = get_discussion_by_id(discussion_id) or {}
+        raw_p = disc.get("participants", [])
+        for p in raw_p:
+            if isinstance(p, dict):
+                em = str(p.get("Email") or p.get("user_email") or p.get("email") or "").strip().lower()
+            else:
+                em = str(p).strip().lower()
+            if em and "@" in em and em not in emails:
+                emails.append(em)
+    except Exception:
+        pass
 
-    smtp_server, smtp_port, smtp_user, smtp_password = smtp_cfg
-    pin_formatte = normalize_pin(pin)
-    sujet = "[PermutStage] Récupération de votre code PIN"
-    corps = (
-        f"Bonjour {prenom},\\n\\n"
-        f"Vous avez demandé la récupération de votre code PIN pour accéder à PermutStage.\\n\\n"
-        f"Votre code PIN de connexion est : {pin_formatte}\\n\\n"
-        f"Vous pouvez désormais vous connecter directement sur la plateforme avec votre adresse étudiante et ce code PIN.\\n\\n"
-        f"L'équipe PermutStage"
-    )
+    if not emails:
+        try:
+            df = load_demandes_data()
+            all_m = compute_bilateral_matches(df) + compute_triangular_matches(df)
+            for m in all_m:
+                if m.get("room_id") == discussion_id:
+                    for p in m.get("participants", []):
+                        em = str(p.get("Email") or p.get("user_email") or "").strip().lower()
+                        if em and em not in emails:
+                            emails.append(em)
+                    break
+        except Exception:
+            pass
 
-    with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as server:
-        if smtp_port in (587, 25):
-            server.starttls()
-        server.login(smtp_user, smtp_password)
-        msg = MIMEText(corps, "plain", "utf-8")
-        msg["Subject"] = sujet
-        msg["From"] = smtp_user
-        msg["To"] = dest_email.strip().lower()
-        server.send_message(msg)
-    return True
+    return emails
+
+def send_first_message_notification(discussion_id: str, sender_email: str, sender_name: str, texte: str) -> None:
+    """
+    Envoie une notification par email lors du TOUT PREMIER message dans un salon.
+    Notifie UNIQUEMENT les autres participants du salon (exclut l'expéditeur).
+    """
+    clean_sender_email = str(sender_email or "").strip().lower()
+    clean_sender_name = str(sender_name or "").strip() or clean_sender_email
+    participant_emails = get_discussion_participant_emails(discussion_id)
+
+    sujet = "[PermutStage] Nouveau message dans votre salon d'échange"
+    apercu = texte.strip()
+    if len(apercu) > 280:
+        apercu = apercu[:280] + "..."
+
+    for dest_email in participant_emails:
+        if not dest_email or dest_email == clean_sender_email:
+            continue
+
+        corps = (
+            f"Bonjour,\n\n"
+            f"{clean_sender_name} vient d'envoyer un premier message dans votre salon d'échange sur PermutStage :\n\n"
+            f"« {apercu} »\n\n"
+            f"Connectez-vous dès à présent avec votre adresse étudiante et votre code PIN pour lui répondre et organiser votre permutation :\n"
+            f"👉 Rejoindre le salon privé : https://permutstage.onrender.com/salon/{discussion_id}\n\n"
+            f"L'équipe PermutStage"
+        )
+        try:
+            _send_email_smtp(dest_email, sujet, corps)
+        except Exception as exc:
+            logger.warning(f"[PermutStage] Échec envoi notification premier message à {dest_email}: {exc}")
 
 # ---------------------------------------------------------------------------
 # 9. COMPOSANT CHECKBOX HÔPITAUX SOUHAITÉS AVEC SÉLECTION PAR PROVINCE
@@ -1932,12 +2112,32 @@ def render_header(session, active_tab="accueil", req: Request = None):
     if user_email:
         display_name = f"{user_prenom} {user_nom}".strip() or user_email
         auth_section = Div(
-            A(
-                f"👤 {display_name}",
-                href="/profil",
-                title="Accéder à mon profil étudiant et modifier mes informations / code PIN",
-                cls="auth-connected-indicator",
-                style="font-weight:700; font-size:0.85rem; color:#1d4ed8; background:#eff6ff; padding:0.35rem 0.75rem; border-radius:9999px; margin-right:0.6rem; border:1px solid #bfdbfe; text-decoration:none; display:inline-flex; align-items:center; cursor:pointer;"
+            Details(
+                Summary(
+                    f"👤 {display_name} ▾",
+                    role="button",
+                    cls="outline",
+                    title="Menu profil étudiant : modifier mes informations ou changer mon code PIN",
+                    style="padding:0.35rem 0.75rem; font-size:0.85rem; font-weight:700; border-radius:9999px; margin-right:0.5rem; background:#eff6ff; color:#1d4ed8; border-color:#bfdbfe; cursor:pointer; display:inline-flex; align-items:center; list-style:none;"
+                ),
+                Ul(
+                    Li(
+                        Div(
+                            Strong(display_name, style="display:block; color:#0f172a; font-size:0.88rem;"),
+                            Span(user_email, style="display:block; color:#64748b; font-size:0.75rem; font-family:monospace;"),
+                            style="padding:0.4rem 0.75rem; border-bottom:1px solid #e2e8f0; margin-bottom:0.25rem;"
+                        )
+                    ),
+                    Li(A("👤 Mon Profil complet", href="/profil", style="display:flex; align-items:center; gap:0.5rem; padding:0.4rem 0.75rem; font-weight:600; color:#1e293b; text-decoration:none; border-radius:6px;")),
+                    Li(A("🔒 Changer mon code PIN", href="/profil#changer-pin", style="display:flex; align-items:center; gap:0.5rem; padding:0.4rem 0.75rem; font-weight:700; color:#1d4ed8; text-decoration:none; border-radius:6px; background:#eff6ff;")),
+                    Li(A("📋 Gérer mon offre", href="/gerer", style="display:flex; align-items:center; gap:0.5rem; padding:0.4rem 0.75rem; font-weight:600; color:#1e293b; text-decoration:none; border-radius:6px;")),
+                    Li(A("💬 Mes Matchs & Salons", href="/matchs", style="display:flex; align-items:center; gap:0.5rem; padding:0.4rem 0.75rem; font-weight:600; color:#1e293b; text-decoration:none; border-radius:6px;")),
+                    Li(Hr(style="margin:0.25rem 0; border-color:#e2e8f0;")),
+                    Li(A("🚪 Se déconnecter", href="/logout", style="display:flex; align-items:center; gap:0.5rem; padding:0.4rem 0.75rem; font-weight:700; color:#dc2626; text-decoration:none; border-radius:6px;")),
+                    style="background:#ffffff; border:1px solid #cbd5e1; border-radius:12px; box-shadow:0 10px 25px -5px rgba(15,23,42,0.18), 0 8px 10px -6px rgba(15,23,42,0.1); padding:0.4rem; min-width:230px; position:absolute; right:0; margin-top:0.35rem; z-index:99999;"
+                ),
+                cls="dropdown",
+                style="position:relative; display:inline-block; margin-right:0.4rem;"
             ),
             A(
                 "🔔 Notifications",
@@ -2335,7 +2535,10 @@ def get(session, req: Request = None):
                     style="margin-top:0.6rem;"
                 )
             else:
-                status_tag = Span("Binôme direct", cls="status-badge status-disponible", style="float:right;")
+                if statut == "en discussion":
+                    status_tag = Span("💬 En discussion", cls="status-badge", style="background:#dbeafe; color:#1e40af; border:1px solid #bfdbfe; font-weight:700; font-size:0.78rem; padding:0.25rem 0.65rem; border-radius:9999px; float:right;")
+                else:
+                    status_tag = Span("⏳ Nouveau salon", cls="status-badge", style="background:#f1f5f9; color:#475569; border:1px solid #cbd5e1; font-weight:700; font-size:0.78rem; padding:0.25rem 0.65rem; border-radius:9999px; float:right;")
                 accord_action = Div(
                     Form(
                         Input(type="hidden", name="discussion_id", value=room_id),
@@ -2345,8 +2548,7 @@ def get(session, req: Request = None):
                             cls="outline",
                             style="border-color:#16a34a; color:#166534; font-weight:700; border-radius:8px; font-size:0.8rem; padding:0.35rem 0.75rem; margin:0;",
                         ),
-                        hx_post="/confirmer-accord",
-                        hx_confirm="🤝 Confirmation requise : Avez-vous trouvé un accord de permutation avec votre binôme ? Le salon passera au statut 'Accord trouvé'.",
+                        hx_post="/demander-confirmation-accord",
                         hx_target=f"#match-accord-{slugify(room_id)}",
                         hx_swap="outerHTML"
                     ),
@@ -2427,27 +2629,11 @@ def get(session, req: Request = None):
                     id=f"match-accord-{slugify(room_id)}",
                     style="background:#f0fdf4; border:1px solid #86efac; padding:0.5rem 0.75rem; border-radius:8px; margin-top:0.6rem;"
                 )
-            elif statut_t == "en discussion":
-                status_tag_t = Span("💬 En discussion", cls="status-badge", style="background:#dbeafe; color:#1e40af; border:1px solid #bfdbfe; font-weight:700; font-size:0.78rem; padding:0.25rem 0.65rem; border-radius:9999px; float:right;")
-                accord_action_t = Div(
-                    Form(
-                        Input(type="hidden", name="discussion_id", value=room_id),
-                        Button(
-                            "🤝 Confirmer l'accord trouvé",
-                            type="submit",
-                            cls="outline",
-                            style="border-color:#16a34a; color:#166534; font-weight:700; border-radius:8px; font-size:0.8rem; padding:0.35rem 0.75rem; margin:0;",
-                        ),
-                        hx_post="/confirmer-accord",
-                        hx_confirm="🤝 Confirmation requise : Avez-vous trouvé un accord de permutation avec l'ensemble des membres de ce cycle ? Le salon passera au statut 'Accord trouvé'.",
-                        hx_target=f"#match-accord-{slugify(room_id)}",
-                        hx_swap="outerHTML"
-                    ),
-                    id=f"match-accord-{slugify(room_id)}",
-                    style="margin-top:0.6rem;"
-                )
             else:
-                status_tag_t = Span("Cycle à 3", cls="status-badge status-accord", style="float:right;")
+                if statut_t == "en discussion":
+                    status_tag_t = Span("💬 En discussion", cls="status-badge", style="background:#dbeafe; color:#1e40af; border:1px solid #bfdbfe; font-weight:700; font-size:0.78rem; padding:0.25rem 0.65rem; border-radius:9999px; float:right;")
+                else:
+                    status_tag_t = Span("⏳ Nouveau salon", cls="status-badge", style="background:#f1f5f9; color:#475569; border:1px solid #cbd5e1; font-weight:700; font-size:0.78rem; padding:0.25rem 0.65rem; border-radius:9999px; float:right;")
                 accord_action_t = Div(
                     Form(
                         Input(type="hidden", name="discussion_id", value=room_id),
@@ -2457,8 +2643,7 @@ def get(session, req: Request = None):
                             cls="outline",
                             style="border-color:#16a34a; color:#166534; font-weight:700; border-radius:8px; font-size:0.8rem; padding:0.35rem 0.75rem; margin:0;",
                         ),
-                        hx_post="/confirmer-accord",
-                        hx_confirm="🤝 Confirmation requise : Avez-vous trouvé un accord de permutation avec l'ensemble des membres de ce cycle ? Le salon passera au statut 'Accord trouvé'.",
+                        hx_post="/demander-confirmation-accord",
                         hx_target=f"#match-accord-{slugify(room_id)}",
                         hx_swap="outerHTML"
                     ),
@@ -2560,7 +2745,7 @@ def get(session, id: str, req: Request = None):
                 P("Tous les participants ont validé leur accord d'échange pour ce salon. Félicitations ! Pensez à transmettre votre accord officiel à la commission des stages de votre faculté."),
                 style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1rem; border-radius:10px; margin-bottom:1rem;"
             ),
-            id=f"accord-section-{slugify(disc_id)}"
+            id=f"match-accord-{slugify(disc_id)}"
         )
     else:
         accord_banner = Div(
@@ -2580,14 +2765,13 @@ def get(session, id: str, req: Request = None):
                         cls="primary",
                         style="background:#16a34a; border-color:#16a34a; font-weight:700; border-radius:8px; font-size:0.88rem; padding:0.45rem 1rem; width:auto;",
                     ),
-                    hx_post="/confirmer-accord",
-                    hx_confirm="🤝 Confirmation requise : Avez-vous convenu de l'ensemble des modalités d'échange avec vos correspondants et confirmez-vous cet accord ? Cette action passera définitivement le salon au statut 'Accord trouvé'.",
-                    hx_target=f"#accord-section-{slugify(disc_id)}",
+                    hx_post="/demander-confirmation-accord",
+                    hx_target=f"#match-accord-{slugify(disc_id)}",
                     hx_swap="outerHTML"
                 ),
                 style="background:#f8fafc; border:1px solid #e2e8f0; padding:1rem; border-radius:10px; margin-bottom:1rem;"
             ),
-            id=f"accord-section-{slugify(disc_id)}"
+            id=f"match-accord-{slugify(disc_id)}"
         )
 
     return Main(
@@ -2646,6 +2830,48 @@ def post(session, req: Request = None, discussion_id: str = "", room_id: str = "
         )
     return Div(*elements)
 
+@rt("/demander-confirmation-accord")
+def post(session, req: Request = None, discussion_id: str = ""):
+    u = get_session_user(session, req)
+    if not u or not u.get("email"):
+        return Article(P("⚠️ Session expirée. Veuillez vous reconnecter.", style="color:#b91c1c; font-weight:600;"), cls="contrast")
+
+    disc_id = str(discussion_id).strip()
+    if not disc_id and req is not None:
+        try:
+            rf = getattr(req, "_form", None)
+            if rf: disc_id = str(rf.get("discussion_id", "")).strip()
+        except Exception:
+            pass
+
+    return Div(
+        Article(
+            H4("🤝 Confirmation d'accord trouvé", style="color:#166534; font-weight:800; margin-bottom:0.4rem;"),
+            P("Avez-vous convenu de l'ensemble des modalités de permutation avec l'ensemble des correspondants de ce salon ?", style="font-weight:600; color:#14532d; margin-bottom:0.3rem;"),
+            P("En validant, le statut du salon passera officiellement à 'Accord trouvé'. Un message automatique de confirmation sera consigné dans le salon pour acter cette entente.", style="font-size:0.85rem; color:#166534; margin-bottom:0.75rem;"),
+            Div(
+                Form(
+                    Input(type="hidden", name="discussion_id", value=disc_id),
+                    Button(
+                        "✅ Oui, confirmer l'accord trouvé",
+                        type="submit",
+                        cls="primary",
+                        style="background:#16a34a; border-color:#16a34a; font-weight:700; border-radius:8px; font-size:0.85rem; padding:0.45rem 1rem;",
+                    ),
+                    hx_post="/confirmer-accord",
+                    hx_confirm="🤝 Confirmation requise : Avez-vous convenu de l'ensemble des modalités d'échange avec vos correspondants et confirmez-vous cet accord ? Cette action passera définitivement le salon au statut 'Accord trouvé'.",
+                    hx_target=f"#match-accord-{slugify(disc_id)}",
+                    hx_swap="outerHTML",
+                    style="display:inline-block; margin-right:0.5rem; margin-bottom:0;"
+                ),
+                A("Annuler", href="/matchs", role="button", cls="outline secondary", style="border-radius:8px; font-size:0.85rem; padding:0.45rem 1rem; text-decoration:none;"),
+                style="display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap; margin-top:0.5rem;"
+            ),
+            style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1rem; border-radius:10px; margin-top:0.6rem;"
+        ),
+        id=f"match-accord-{slugify(disc_id)}"
+    )
+
 @rt("/confirmer-accord")
 def post(session, req: Request = None, discussion_id: str = ""):
     u = get_session_user(session, req)
@@ -2682,7 +2908,7 @@ def post(session, req: Request = None, discussion_id: str = ""):
             P("Conservez vos coordonnées et soumettez votre dossier conjoint de permutation à votre commission de stage facultaire.", style="font-size:0.85rem; color:#166534; margin:0;"),
             style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1rem; border-radius:10px; margin-bottom:1rem;"
         ),
-        id=f"accord-section-{slugify(disc_id)}"
+        id=f"match-accord-{slugify(disc_id)}"
     )
 
 # === VUE 4 : CATALOGUE PUBLIC (ANONYMISÉ PAR CONFIDENTIALITÉ) ===
@@ -2908,7 +3134,26 @@ async def post(session, req: Request = None, demande_id: str = "", periode: str 
         "statut": statut,
     }
 
+    df_demandes_avant = load_demandes_data()
+    all_bi_avant = compute_bilateral_matches(df_demandes_avant)
+    all_tri_avant = compute_triangular_matches(df_demandes_avant)
+    anciens_rooms = {m["room_id"] for m in all_bi_avant} | {t["room_id"] for t in all_tri_avant}
+
     if save_demande(update_payload):
+        df_maj = load_demandes_data()
+        df_users = load_all_users()
+        try:
+            nouveaux_bi = compute_bilateral_matches(df_maj)
+            nouveaux_tri = compute_triangular_matches(df_maj)
+            for m in nouveaux_bi:
+                if m["room_id"] not in anciens_rooms:
+                    send_match_notification_emails(m["participants"], m["periode"], m["specialite"], m["room_id"], df_users)
+            for t in nouveaux_tri:
+                if t["room_id"] not in anciens_rooms:
+                    send_match_notification_emails(t["participants"], t["periode"], t["specialite"], t["room_id"], df_users)
+        except Exception as exc:
+            logger.warning(f"[PermutStage] Erreur non-bloquante notification match après modif: {exc}")
+
         return Article(
             P("✅ Offre mise à jour avec succès dans Firestore !"),
             style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:0.75rem; margin-bottom:1rem; border-radius:8px;"
@@ -3174,6 +3419,12 @@ def handle_inscription(session, prenom: str = "", nom: str = "", email: str = ""
             style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
         )
 
+    # Envoi de l'e-mail de bienvenue automatique avec rappel des identifiants (non-bloquant)
+    try:
+        send_welcome_email(clean_email, clean_prenom, clean_nom, clean_pin)
+    except Exception as mail_exc:
+        logger.warning(f"[PermutStage Inscription] Erreur non-bloquante envoi email bienvenue: {mail_exc}")
+
     # 6. Enregistrement direct et complet dans la session FastHTML
     session["user_id"] = clean_email
     session["user_email"] = clean_email
@@ -3241,89 +3492,62 @@ def get(session, req: Request = None):
     )
 
 @rt("/forgot-pin")
-def post(session, email: str = ""):
-    em_clean = str(email).strip().lower()
-    user_doc = get_user_by_email(em_clean)
+def post(session, email: str = "", req: Request = None):
+    em_clean = str(email or "").strip().lower()
+    if not em_clean and req is not None:
+        try:
+            rf = getattr(req, "_form", None)
+            if rf:
+                em_clean = str(rf.get("email", "")).strip().lower()
+            if not em_clean:
+                qp = req.query_params
+                if qp and qp.get("email"):
+                    em_clean = str(qp.get("email", "")).strip().lower()
+        except Exception:
+            pass
 
-    if not user_doc:
+    if not em_clean:
         return Article(
-            P("⚠️ Aucun compte n'est associé à cette adresse email dans Firestore.", style="color:#b91c1c; font-weight:700; margin:0;"),
-            P("Vérifiez l'orthographe de votre email ou créez un compte étudiant.", style="font-size:0.85rem; color:#64748b; margin-top:0.3rem;"),
-            A("Créer mon compte", href="/login-view", role="button", cls="outline", style="margin-top:0.5rem; border-radius:8px;"),
+            P("⚠️ Veuillez renseigner votre adresse email institutionnelle.", style="color:#b91c1c; font-weight:700; margin:0;"),
             style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px;"
         )
 
-    pin = normalize_pin(user_doc.get("code_pin") or user_doc.get("PIN") or "")
-    prenom = str(user_doc.get("prenom") or user_doc.get("Prenom") or "étudiant").strip()
+    smtp_cfg = get_smtp_config()
+    if not smtp_cfg:
+        # Mesure de sécurité stricte : aucun code PIN ne doit jamais être affiché en clair sur l'écran
+        return Article(
+            H4("🔒 Sécurité & Confidentialité des accès", style="color:#991b1b; font-weight:800; margin-bottom:0.4rem;"),
+            P("Pour des raisons de stricte confidentialité entre étudiants, aucun code PIN ne peut être affiché directement à l'écran."),
+            P("La transmission de votre code PIN s'effectue exclusivement par email sécurisé vers votre boîte institutionnelle. Or, le service d'envoi d'email automatique (SMTP) n'est pas encore configuré sur ce serveur d'hébergement.", style="font-size:0.88rem; color:#475569; margin:0.5rem 0; line-height:1.5;"),
+            P("💡 Si vous avez oublié votre code PIN, veuillez contacter l'administrateur de la plateforme pour réinitialiser votre accès ou vous connecter si vous vous souvenez de votre code.", style="font-size:0.85rem; color:#1e293b; font-weight:600; margin-top:0.6rem;"),
+            Div(
+                A("Retour à la page de connexion", href="/login-view", role="button", cls="outline", style="border-radius:8px; margin-top:0.75rem; font-size:0.85rem;"),
+                style="margin-top:0.75rem;"
+            ),
+            style="background:#fef2f2; border:1px solid #fecaca; color:#991b1b; padding:1.25rem; border-radius:12px;"
+        )
 
-    # Tentative d'envoi par email si SMTP est configuré
-    smtp_envoye = False
-    if get_smtp_config():
+    # Si SMTP est configuré, envoyer l'email de manière sécurisée
+    user_doc = get_user_by_email(em_clean)
+    if user_doc:
+        pin = normalize_pin(user_doc.get("code_pin") or user_doc.get("PIN") or "")
+        prenom = str(user_doc.get("prenom") or user_doc.get("Prenom") or "étudiant").strip()
         try:
             send_pin_recovery_email(em_clean, prenom, pin)
-            smtp_envoye = True
         except Exception as err:
             logger.warning(f"[PermutStage] Envoi email échoué: {err}")
+            return Article(
+                H4("⚠️ Service d'envoi temporairement indisponible", style="color:#b91c1c; font-weight:800; margin-bottom:0.4rem;"),
+                P("Une erreur est survenue lors de l'envoi de l'email de récupération. Veuillez réessayer ultérieurement ou contacter l'administrateur.", style="margin:0; font-size:0.88rem;"),
+                style="background:#fef2f2; border:1px solid #fecaca; color:#b91c1c; padding:1rem; border-radius:10px;"
+            )
 
-    if smtp_envoye:
-        return Article(
-            H4("📧 Email envoyé !", style="color:#14532d; font-weight:800; margin-bottom:0.4rem;"),
-            P(f"Votre code PIN a été envoyé à {em_clean}."),
-            A("Se connecter", href="/login-view", role="button", cls="primary", style="border-radius:8px; margin-top:0.5rem;"),
-            style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1.25rem; border-radius:12px;"
-        )
-
-    # Repli immédiat et sécurisé sans SMTP : affichage direct et option de redéfinition
+    # Réponse générique conforme aux bonnes pratiques de sécurité (aucun PIN affiché)
     return Article(
-        H4("🔑 Récupération directe de votre code PIN", style="color:#1e40af; font-weight:800; margin-bottom:0.4rem;"),
-        P(f"Bonjour {prenom}, le service d'envoi d'email automatique n'étant pas activé sur ce serveur (SMTP non configuré), voici votre accès direct :"),
-        Div(
-            P("Votre code PIN enregistré est :", style="margin-bottom:0.2rem; font-weight:600;"),
-            Div(
-                Strong(pin, style="font-size:1.6rem; letter-spacing:0.25rem; color:#1d4ed8; background:#dbeafe; padding:0.4rem 1rem; border-radius:8px; display:inline-block; border:1px solid #bfdbfe;"),
-                style="margin:0.5rem 0;"
-            ),
-            style="background:#f8fafc; padding:0.85rem; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:1rem;"
-        ),
-        Div(
-            A("Se connecter avec ce code PIN", href="/login-view", role="button", cls="primary", style="border-radius:8px; margin-right:0.5rem;"),
-            style="margin-top:0.75rem;"
-        ),
-        Details(
-            Summary("🔄 Ou définir un nouveau code PIN maintenant", style="font-size:0.85rem; font-weight:600; cursor:pointer; margin-top:0.75rem;"),
-            Form(
-                Input(type="hidden", name="email", value=em_clean),
-                Label("Nouveau code PIN (4 chiffres)", Input(name="new_pin", type="password", maxlength=4, placeholder="••••", required=True)),
-                Button("Enregistrer le nouveau code PIN", type="submit", cls="outline", style="border-radius:8px; font-weight:700; width:100%;"),
-                hx_post="/reset-pin-direct",
-                hx_target="#forgot-feedback",
-                hx_swap="innerHTML"
-            ),
-            style="margin-top:0.75rem;"
-        ),
-        style="background:#eff6ff; border:1px solid #bfdbfe; color:#1e3a8a; padding:1.25rem; border-radius:12px;"
-    )
-
-@rt("/reset-pin-direct")
-def post(session, email: str = "", new_pin: str = ""):
-    em_clean = str(email).strip().lower()
-    clean_p = normalize_pin(str(new_pin).strip())
-    if len(clean_p) != 4 or not clean_p.isdigit():
-        return Article(
-            P("⚠️ Le code PIN doit comporter exactement 4 chiffres numériques.", style="color:#b91c1c; font-weight:600; margin:0;"),
-            style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px;"
-        )
-    user_doc = get_user_by_email(em_clean)
-    if not user_doc:
-        return Article(
-            P("⚠️ Compte introuvable.", style="color:#b91c1c; font-weight:600; margin:0;"),
-            style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px;"
-        )
-    update_user_pin(em_clean, clean_p)
-    return Article(
-        H4("✅ Nouveau code PIN enregistré !", style="color:#14532d; font-weight:800; margin-bottom:0.4rem;"),
-        P(f"Votre nouveau code PIN est désormais : Strong({clean_p}). Vous pouvez l'utiliser immédiatement pour vous connecter."),
-        A("Se connecter à mon espace", href="/login-view", role="button", cls="primary", style="border-radius:8px; margin-top:0.5rem;"),
+        H4("📧 Demande enregistrée avec succès", style="color:#14532d; font-weight:800; margin-bottom:0.4rem;"),
+        P(f"Si l'adresse {em_clean} correspond à un compte étudiant existant, un email contenant votre code PIN de connexion vient de vous être expédié."),
+        P("Veuillez consulter votre boîte de réception ainsi que vos courriers indésirables (dossier spams).", style="font-size:0.85rem; color:#166534; margin:0.35rem 0;"),
+        A("Retour à la connexion", href="/login-view", role="button", cls="primary", style="border-radius:8px; margin-top:0.75rem;"),
         style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1.25rem; border-radius:12px;"
     )
 
@@ -3388,12 +3612,15 @@ def get(session, req: Request = None):
                             style="display:grid; grid-template-columns: 1fr 1fr; gap:0.5rem;"
                         ),
                         Hr(style="margin:1.25rem 0;"),
-                        H4("🔒 Modification du code PIN", style="font-weight:700; font-size:1rem; margin-bottom:0.3rem;"),
-                        P(f"Code PIN actuel enregistré : {current_pin} (laisser vide ci-dessous si vous souhaitez le conserver).", style="font-size:0.85rem; color:#64748b; margin-bottom:0.75rem;"),
                         Div(
-                            Div(Label("Nouveau code PIN (4 chiffres)", Input(name="nouveau_pin", type="password", maxlength=4, placeholder="••••"))),
-                            Div(Label("Confirmer le code PIN", Input(name="confirmer_pin", type="password", maxlength=4, placeholder="••••"))),
-                            style="display:grid; grid-template-columns: 1fr 1fr; gap:0.5rem;"
+                            H4("🔒 Modification du code PIN", id="changer-pin", style="font-weight:700; font-size:1.05rem; margin-bottom:0.3rem; color:#1d4ed8; scroll-margin-top:2rem;"),
+                            P(f"Code PIN actuel : {current_pin} (laisser vide ci-dessous si vous souhaitez le conserver).", style="font-size:0.85rem; color:#64748b; margin-bottom:0.75rem;"),
+                            Div(
+                                Div(Label("Nouveau code PIN (4 chiffres)", Input(name="nouveau_pin", type="password", maxlength=4, placeholder="••••"))),
+                                Div(Label("Confirmer le code PIN", Input(name="confirmer_pin", type="password", maxlength=4, placeholder="••••"))),
+                                style="display:grid; grid-template-columns: 1fr 1fr; gap:0.5rem;"
+                            ),
+                            style="background:#f8fafc; border:1px solid #bfdbfe; border-radius:10px; padding:1rem; margin-bottom:1rem;"
                         ),
                         Button("💾 Enregistrer les modifications", type="submit", cls="primary", style="border-radius:8px; font-weight:700; width:100%; margin-top:1.25rem;"),
                         hx_post="/modifier-profil",
