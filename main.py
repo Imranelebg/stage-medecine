@@ -22,12 +22,17 @@ import os
 import re
 import uuid
 import json
+import time
+import logging
 import smtplib
 from email.mime.text import MIMEText
 from datetime import datetime
 import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, firestore
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("PermutStage")
 
 # ---------------------------------------------------------------------------
 # 1. DESIGN SYSTEM & INITIALISATION DE L'APPLICATION FASTHTML (Pico.css)
@@ -497,6 +502,28 @@ def normalize_pin(val: str) -> str:
     return s.zfill(4) if (s.isdigit() and len(s) <= 4) else s
 
 # ---------------------------------------------------------------------------
+# CACHE MÉMOIRE HAUTE PERFORMANCE (ZÉRO CHARGEMENT À L'INFINI)
+# ---------------------------------------------------------------------------
+_CACHE_DEMANDES = {"df": None, "timestamp": 0.0}
+_CACHE_USERS = {"df": None, "timestamp": 0.0}
+CACHE_TTL = 30.0  # Durée de validité du cache en secondes
+
+def invalidate_cache(target: str = "all"):
+    """Invalide immédiatement le cache mémoire lors de modifications de données."""
+    global _CACHE_DEMANDES, _CACHE_USERS
+    if target in ("all", "demandes"):
+        _CACHE_DEMANDES["timestamp"] = 0.0
+        _CACHE_DEMANDES["df"] = None
+    if target in ("all", "users"):
+        _CACHE_USERS["timestamp"] = 0.0
+        _CACHE_USERS["df"] = None
+
+def build_discussion_id(type_match: str, participants: list[str]) -> str:
+    """Génère de façon déterministe et instantanée (en mémoire) l'identifiant de salon."""
+    sorted_p = sorted([str(p).lower().strip() for p in participants if p and str(p).strip()])
+    return f"disc_{type_match}_{'_'.join(sorted_p)}".replace("@", "_at_").replace(".", "_")
+
+# ---------------------------------------------------------------------------
 # 3. INITIALISATION GOOGLE CLOUD FIREBASE FIRESTORE & PERSISTANCE GARANTIE
 # ---------------------------------------------------------------------------
 _FIRESTORE_CLIENT = None
@@ -660,10 +687,12 @@ def create_or_update_user(user_data: dict) -> bool:
     avec comme clé unique l'email de l'étudiant (.document(email.lower().strip())).
     Champs requis : email, nom, code_pin, created_at, statut.
     """
-    clean_email = user_data["email"].strip().lower()
+    clean_email = (user_data.get("email") or user_data.get("Email") or "").strip().lower()
+    if not clean_email:
+        return False
     pin = normalize_pin(user_data.get("code_pin") or user_data.get("PIN") or "")
-    nom = user_data.get("nom") or user_data.get("Nom") or ""
-    prenom = user_data.get("prenom") or user_data.get("Prenom") or ""
+    nom = str(user_data.get("nom") or user_data.get("Nom") or "").strip()
+    prenom = str(user_data.get("prenom") or user_data.get("Prenom") or "").strip()
     created_at = user_data.get("created_at") or datetime.now().isoformat()
     statut = user_data.get("statut") or "actif"
 
@@ -688,14 +717,19 @@ def create_or_update_user(user_data: dict) -> bool:
     if db is not None:
         try:
             db.collection(COLLECTION_USERS).document(clean_email).set(doc_payload)
+            print(f"[PermutStage] Succès écriture Firestore user: {clean_email}")
         except Exception as exc:
             print(f"[PermutStage] Erreur écriture Firestore user: {exc}")
+            logger.error(f"[PermutStage] Erreur écriture Firestore user: {exc}")
 
     # 2. Écriture persistante sur disque local
     local = load_local_db()
     if "users" not in local: local["users"] = {}
     local["users"][clean_email] = doc_payload
     save_local_db(local)
+
+    # Invalidation du cache mémoire
+    invalidate_cache("users")
     return True
 
 def update_user_pin(email: str, new_pin: str) -> bool:
@@ -724,6 +758,9 @@ def update_user_pin(email: str, new_pin: str) -> bool:
             d["code_pin"] = clean_pin
             d["PIN"] = clean_pin
     save_local_db(local)
+
+    # Invalidation du cache mémoire
+    invalidate_cache("users")
     return True
 
 def delete_user_and_demandes(email: str) -> bool:
@@ -745,10 +782,18 @@ def delete_user_and_demandes(email: str) -> bool:
     to_del = [k for k, v in local.get("demandes", {}).items() if (v.get("user_email") or v.get("Email") or "").lower() == clean_email]
     for k in to_del: local["demandes"].pop(k, None)
     save_local_db(local)
+
+    # Invalidation du cache mémoire
+    invalidate_cache("all")
     return True
 
-def load_all_users() -> pd.DataFrame:
-    """Lit l'ensemble des comptes de la collection 'users'."""
+def load_all_users(force_refresh: bool = False) -> pd.DataFrame:
+    """Lit l'ensemble des comptes de la collection 'users' (avec cache mémoire)."""
+    global _CACHE_USERS
+    now = time.time()
+    if not force_refresh and _CACHE_USERS["df"] is not None and (now - _CACHE_USERS["timestamp"]) < CACHE_TTL:
+        return _CACHE_USERS["df"].copy()
+
     db = get_firestore_client()
     users_list = []
     if db is not None:
@@ -768,17 +813,22 @@ def load_all_users() -> pd.DataFrame:
         local = load_local_db()
         users_list = list(local.get("users", {}).values())
 
+    cols = ["email", "nom", "prenom", "code_pin", "created_at", "statut"]
     if not users_list:
-        return pd.DataFrame(columns=["email", "nom", "prenom", "code_pin", "created_at", "statut"])
-    df = pd.DataFrame(users_list)
-    for c in ["email", "nom", "prenom", "code_pin", "created_at", "statut"]:
-        if c not in df.columns: df[c] = ""
-    # Aliases
-    df["Email"] = df["email"]
-    df["Nom"] = df["nom"]
-    df["Prenom"] = df["prenom"]
-    df["PIN"] = df["code_pin"]
-    df["User_ID"] = df["email"]
+        df = pd.DataFrame(columns=cols)
+    else:
+        df = pd.DataFrame(users_list)
+        for c in cols:
+            if c not in df.columns: df[c] = ""
+        # Aliases
+        df["Email"] = df["email"]
+        df["Nom"] = df["nom"]
+        df["Prenom"] = df["prenom"]
+        df["PIN"] = df["code_pin"]
+        df["User_ID"] = df["email"]
+
+    _CACHE_USERS["df"] = df.copy()
+    _CACHE_USERS["timestamp"] = now
     return df
 
 # ---------------------------------------------------------------------------
@@ -849,6 +899,9 @@ def save_demande(demande_dict: dict) -> bool:
     if "demandes" not in local: local["demandes"] = {}
     local["demandes"][doc_id] = doc_payload
     save_local_db(local)
+
+    # Invalidation du cache mémoire
+    invalidate_cache("demandes")
     return True
 
 def delete_demande(demande_id: str) -> bool:
@@ -864,10 +917,18 @@ def delete_demande(demande_id: str) -> bool:
     local = load_local_db()
     local.get("demandes", {}).pop(clean_id, None)
     save_local_db(local)
+
+    # Invalidation du cache mémoire
+    invalidate_cache("demandes")
     return True
 
-def load_demandes_data() -> pd.DataFrame:
-    """Lit toutes les annonces de la collection 'demandes'."""
+def load_demandes_data(force_refresh: bool = False) -> pd.DataFrame:
+    """Lit toutes les annonces de la collection 'demandes' (avec cache mémoire)."""
+    global _CACHE_DEMANDES
+    now = time.time()
+    if not force_refresh and _CACHE_DEMANDES["df"] is not None and (now - _CACHE_DEMANDES["timestamp"]) < CACHE_TTL:
+        return _CACHE_DEMANDES["df"].copy()
+
     db = get_firestore_client()
     demandes_list = []
     if db is not None:
@@ -905,10 +966,14 @@ def load_demandes_data() -> pd.DataFrame:
 
     cols = ["Demande_ID", "Timestamp", "Nom", "Email", "Periode", "Specialite", "Hopital_Actuel", "Hopitaux_Souhaites", "Statut", "user_email", "nom_etudiant", "hopitaux_souhaites", "updated_at"]
     if not demandes_list:
-        return pd.DataFrame(columns=cols)
-    df = pd.DataFrame(demandes_list)
-    for c in cols:
-        if c not in df.columns: df[c] = ""
+        df = pd.DataFrame(columns=cols)
+    else:
+        df = pd.DataFrame(demandes_list)
+        for c in cols:
+            if c not in df.columns: df[c] = ""
+
+    _CACHE_DEMANDES["df"] = df.copy()
+    _CACHE_DEMANDES["timestamp"] = now
     return df
 
 # ---------------------------------------------------------------------------
@@ -1112,12 +1177,7 @@ def compute_bilateral_matches(df: pd.DataFrame) -> list[dict]:
             ):
                 email_a = str(a.get("user_email") or a.get("Email")).strip().lower()
                 email_b = str(b.get("user_email") or b.get("Email")).strip().lower()
-                disc = creer_ou_recuperer_discussion(
-                    participants=[email_a, email_b],
-                    type_match="bilateral",
-                    demande_ids=[str(a.get("Demande_ID") or a.get("demande_id")), str(b.get("Demande_ID") or b.get("demande_id"))]
-                )
-                room_id = disc["discussion_id"]
+                room_id = build_discussion_id("bilateral", [email_a, email_b])
                 matches.append({
                     "room_id": room_id,
                     "discussion_id": room_id,
@@ -1185,16 +1245,7 @@ def compute_triangular_matches(df: pd.DataFrame) -> list[dict]:
                         email_a = str(a.get("user_email") or a.get("Email")).strip().lower()
                         email_b = str(b.get("user_email") or b.get("Email")).strip().lower()
                         email_c = str(c.get("user_email") or c.get("Email")).strip().lower()
-                        disc = creer_ou_recuperer_discussion(
-                            participants=[email_a, email_b, email_c],
-                            type_match="triangulaire",
-                            demande_ids=[
-                                str(a.get("Demande_ID") or a.get("demande_id")),
-                                str(b.get("Demande_ID") or b.get("demande_id")),
-                                str(c.get("Demande_ID") or c.get("demande_id")),
-                            ]
-                        )
-                        room_id = disc["discussion_id"]
+                        room_id = build_discussion_id("triangulaire", [email_a, email_b, email_c])
                         matches.append({
                             "room_id": room_id,
                             "discussion_id": room_id,
@@ -1788,10 +1839,29 @@ def render_footer():
 # === VUE 1 : ACCUEIL & GUIDE ===
 @rt("/")
 def get(session, req: Request = None):
-    df_demandes = load_demandes_data()
-    df_users = load_all_users()
-    all_bi = compute_bilateral_matches(df_demandes)
-    all_tri = compute_triangular_matches(df_demandes)
+    try:
+        df_demandes = load_demandes_data()
+    except Exception as exc:
+        print(f"[PermutStage] Erreur chargement demandes accueil: {exc}")
+        df_demandes = pd.DataFrame()
+
+    try:
+        df_users = load_all_users()
+    except Exception as exc:
+        print(f"[PermutStage] Erreur chargement users accueil: {exc}")
+        df_users = pd.DataFrame()
+
+    try:
+        all_bi = compute_bilateral_matches(df_demandes)
+    except Exception as exc:
+        print(f"[PermutStage] Erreur matching bilatéral accueil: {exc}")
+        all_bi = []
+
+    try:
+        all_tri = compute_triangular_matches(df_demandes)
+    except Exception as exc:
+        print(f"[PermutStage] Erreur matching triangulaire accueil: {exc}")
+        all_tri = []
 
     return Main(
         render_header(session, "accueil", req),
@@ -2623,30 +2693,30 @@ async def post(session, req: Request = None, email: str = "", pin: str = "", cod
 
 @rt("/inscription")
 @rt("/register")
-async def post(session, req: Request = None, prenom: str = "", nom: str = "", email: str = "", pin: str = "", code_pin: str = ""):
+async def post(session, req: Request = None, prenom: str = "", nom: str = "", email: str = "", pin: str = "", code_pin: str = "", **kwargs):
+    form_data = {}
     if req is not None:
         try:
-            form_data = await req.form()
-            if not prenom and form_data.get("prenom"):
-                prenom = str(form_data.get("prenom"))
-            if not nom and form_data.get("nom"):
-                nom = str(form_data.get("nom"))
-            if not email and form_data.get("email"):
-                email = str(form_data.get("email"))
-            if not pin and (form_data.get("pin") or form_data.get("code_pin")):
-                pin = str(form_data.get("pin") or form_data.get("code_pin"))
+            form = await req.form()
+            form_data = dict(form)
         except Exception as exc:
             logger.warning(f"Erreur extraction form inscription: {exc}")
 
-    clean_prenom = str(prenom or "").strip()
-    clean_nom = str(nom or "").strip()
-    clean_email = str(email or "").strip().lower()
-    clean_pin = normalize_pin(pin or code_pin or "")
+    clean_prenom = str(form_data.get("prenom") or prenom or kwargs.get("prenom") or (req.query_params.get("prenom") if req else "") or "").strip()
+    clean_nom = str(form_data.get("nom") or nom or kwargs.get("nom") or (req.query_params.get("nom") if req else "") or "").strip()
+    clean_email = str(form_data.get("email") or email or kwargs.get("email") or (req.query_params.get("email") if req else "") or "").strip().lower()
+    raw_pin = str(form_data.get("pin") or form_data.get("code_pin") or pin or code_pin or kwargs.get("pin") or kwargs.get("code_pin") or (req.query_params.get("pin") if req else "") or "").strip()
+    clean_pin = normalize_pin(raw_pin)
 
     # 1. Validation assouplie : Prénom et Nom dès 1 caractère
-    if len(clean_prenom) < 1 or len(clean_nom) < 1:
+    if len(clean_prenom) < 1:
         return Article(
-            P("⚠️ Veuillez renseigner votre prénom et votre nom (au moins 1 caractère).", style="color:#b91c1c; font-weight:600; margin:0;"),
+            P("⚠️ Veuillez renseigner votre prénom (au moins 1 caractère).", style="color:#b91c1c; font-weight:600; margin:0;"),
+            style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
+        )
+    if len(clean_nom) < 1:
+        return Article(
+            P("⚠️ Veuillez renseigner votre nom (au moins 1 caractère).", style="color:#b91c1c; font-weight:600; margin:0;"),
             style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
         )
 
@@ -2698,9 +2768,9 @@ async def post(session, req: Request = None, prenom: str = "", nom: str = "", em
         if not saved:
             raise RuntimeError("Échec d'enregistrement create_or_update_user")
     except Exception as exc:
-        logger.error(f"Erreur Firestore lors de create_or_update_user: {exc}")
+        logger.error(f"Erreur Firestore lors de create_or_update_user: {exc}", exc_info=True)
         return Article(
-            P(f"⚠️ Erreur technique lors de l'enregistrement : {exc}. Veuillez réessayer.", style="color:#b91c1c; font-weight:600; margin:0;"),
+            P(f"⚠️ Erreur technique lors de l'enregistrement dans la base de données : {exc}. Veuillez réessayer.", style="color:#b91c1c; font-weight:600; margin:0;"),
             style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
         )
 
@@ -2721,10 +2791,12 @@ async def post(session, req: Request = None, prenom: str = "", nom: str = "", em
             A("Consulter le catalogue", href="/catalogue", role="button", cls="outline", style="border-radius:8px;"),
             style="margin-top:0.75rem;"
         ),
-        Script("""
-            setTimeout(function() {
+        Script(f"""
+            localStorage.setItem('permutstage_auth_email', '{clean_email}');
+            sessionStorage.removeItem('permutstage_logged_out');
+            setTimeout(function() {{
                 window.location.href = '/deposer';
-            }, 800);
+            }}, 800);
         """),
         style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1.25rem; border-radius:12px; margin-bottom:1.5rem;"
     )
