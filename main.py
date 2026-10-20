@@ -1998,8 +1998,7 @@ def render_header(session, active_tab="accueil", req: Request = None):
 def render_footer():
     return Footer(
         Div(
-            P("Plateforme collaborative de permutation de stages hospitaliers · Promotion Médecine 2028 · FastHTML & Firebase Firestore"),
-            Small("Données réelles synchronisées et persistées dans Google Cloud Firestore (Collections: users, demandes, discussions, messages)"),
+            P("Plateforme conçue et développée par ", Strong("Imrane Machbaête"), " — Version Alpha"),
             A("🔒 Accès Administrateur", href="/admin-login-view", style="display:block; margin-top:0.5rem; font-size:0.75rem; color:#94a3b8; text-decoration:none;"),
             style="text-align: center; color: #64748b; font-size: 0.82rem; padding: 2rem 0 1rem 0;"
         ),
@@ -2044,8 +2043,9 @@ def get(session, req: Request = None):
                 Div("✨ PROMOTION MÉDECINE 2028 · MASTER 2", cls="hero-badge"),
                 H1("Trouvez votre binôme de stage idéal en quelques clics", style="font-size:2.1rem; font-weight:800;"),
                 P(
-                    "Bienvenue sur PermutStage, l'application pensée pour fluidifier, simplifier et centraliser les échanges de lieux de stages hospitaliers. "
-                    "Vos souhaits sont analysés en temps réel par notre algorithme de permutation, avec persistance garantie sur Google Cloud Firestore.",
+                    "Bienvenue sur ",
+                    Strong("PermutStage"),
+                    ", la plateforme conçue spécialement pour faciliter et fluidifier les permutations de lieux de stages hospitaliers entre camarades de promotion. Fini les listes dispersées et les messages perdus : vos souhaits sont analysés intelligemment en toute confidentialité.",
                     style="font-size:1.05rem; opacity:0.95; line-height:1.6;"
                 ),
                 Div(
@@ -2069,7 +2069,7 @@ def get(session, req: Request = None):
             Div(
                 Article(
                     Strong("1. Créer son profil"),
-                    P("Nom, prénom, email institutionnel et code PIN à 4 chiffres. Votre compte persiste dans Firestore.", style="font-size:0.85rem; color:#475569; margin-top:0.35rem;"),
+                    P("Nom, prénom, email institutionnel et code PIN à 4 chiffres. Votre compte persiste dans la base de données.", style="font-size:0.85rem; color:#475569; margin-top:0.35rem;"),
                 ),
                 Article(
                     Strong("2. Déposer son offre"),
@@ -2137,7 +2137,7 @@ def get(session, req: Request = None):
         render_header(session, "deposer", req),
         Div(
             H2("Déposer une nouvelle offre de permutation", style="font-weight:800; color:#0f172a;"),
-            P("Vos coordonnées sont automatiquement verrouillées sur votre profil étudiant connecté. L'offre sera enregistrée dans Firestore et analysée en temps réel."),
+            P("Vos coordonnées sont automatiquement verrouillées sur votre profil étudiant connecté. L'offre sera enregistrée dans la base de données et analysée en temps réel."),
             Div(id="depot-feedback"),
             Form(
                 Div(
@@ -2516,7 +2516,7 @@ def get(session, req: Request = None):
         render_header(session, "matchs", req),
         Div(
             H2("Mes correspondances privées & Salons de discussion", style="font-weight:800; color:#0f172a;"),
-            P(f"Affichage strictement réservé à votre profil ({user_email}). Les salons et messages sont persistés en temps réel dans Firestore."),
+            P(f"Affichage strictement réservé à votre profil ({user_email}). Les salons et messages sont persistés en temps réel dans la base de données."),
             Div(
                 Div(H3(f"Binômes bilatéraux ({len(my_bi)})", style="font-size:1.15rem; font-weight:700;"), *bi_sections),
                 Div(H3(f"Cycles triangulaires ({len(my_tri)})", style="font-size:1.15rem; font-weight:700;"), *tri_sections),
@@ -2861,7 +2861,7 @@ def get(session, req: Request = None):
         render_header(session, "gerer", req),
         Div(
             H2("Gérer mes annonces publiées", style="font-weight:800; color:#0f172a;"),
-            P("Vous pouvez ajuster vos souhaits à tout moment ou modifier le statut de votre offre ('Disponible', 'En discussion', 'Accord trouvé'). Les modifications sont directement enregistrées dans Firestore."),
+            P("Vous pouvez ajuster vos souhaits à tout moment ou modifier le statut de votre offre ('Disponible', 'En discussion', 'Accord trouvé'). Les modifications sont directement enregistrées dans la base de données."),
             *offres_blocks,
             cls="container"
         ),
