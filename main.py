@@ -563,18 +563,34 @@ def get_firestore_client():
             fb_creds_dict = None
 
             # 1. Variables d'environnement (JSON direct ou chemin de fichier)
-            for env_key in ["FIREBASE_CREDENTIALS", "FIREBASE_CONFIG", "FIREBASE_KEY", "GOOGLE_APPLICATION_CREDENTIALS"]:
+            env_var_names = [
+                "FIREBASE_CREDENTIALS", "FIREBASE_CONFIG", "FIREBASE_KEY",
+                "FIREBASE_SERVICE_ACCOUNT", "FIREBASE_CREDENTIALS_JSON",
+                "FIREBASE_KEY_JSON", "FIREBASE_JSON", "FIREBASE_SECRET",
+                "FIREBASE_ADMIN_CREDENTIALS", "GOOGLE_APPLICATION_CREDENTIALS",
+                "GOOGLE_CREDENTIALS", "SERVICE_ACCOUNT"
+            ]
+            for env_key in env_var_names:
                 raw_env = os.environ.get(env_key)
                 if raw_env:
                     raw_env = raw_env.strip()
+                    # Supprimer d'éventuels guillemets englobants
+                    if (raw_env.startswith("'") and raw_env.endswith("'")) or (raw_env.startswith('"') and raw_env.endswith('"')):
+                        raw_env = raw_env[1:-1].strip()
+
                     if os.path.exists(raw_env):
-                        cred = credentials.Certificate(raw_env)
-                        firebase_admin.initialize_app(cred)
-                        _FIRESTORE_CLIENT = firestore.client()
-                        return _FIRESTORE_CLIENT
+                        try:
+                            cred = credentials.Certificate(raw_env)
+                            firebase_admin.initialize_app(cred)
+                            _FIRESTORE_CLIENT = firestore.client()
+                            print(f"[PermutStage] Firestore initialisé depuis fichier env {env_key}: {raw_env}")
+                            return _FIRESTORE_CLIENT
+                        except Exception as e_cert:
+                            print(f"[PermutStage] Erreur chargement certificat depuis {raw_env}: {e_cert}")
                     else:
                         try:
                             fb_creds_dict = json.loads(raw_env)
+                            print(f"[PermutStage] JSON de configuration Firebase détecté dans variable {env_key}")
                             break
                         except Exception:
                             pass
@@ -596,21 +612,36 @@ def get_firestore_client():
                                     sec = tomllib.load(f)
                                     if "firebase" in sec:
                                         fb_creds_dict = dict(sec["firebase"])
+                                        print(f"[PermutStage] Configuration Firebase trouvée dans {p}")
                                         break
                             except Exception:
                                 pass
 
-            # 3. Fichiers JSON (racine ou dossier /etc/secrets/ de Render)
+            # 3. Fichiers JSON (racine du projet ou dossier /etc/secrets/ de Render)
             if fb_creds_dict is None:
-                for p in [
-                    "serviceAccountKey.json", "firebase_key.json", "firebase-credentials.json", "firebase_credentials.json",
-                    "/etc/secrets/serviceAccountKey.json", "/etc/secrets/firebase_key.json", "/etc/secrets/firebase-credentials.json", "/etc/secrets/firebase_credentials.json"
-                ]:
+                json_candidates = [
+                    "serviceAccountKey.json", "firebase_key.json", "firebase-credentials.json", "firebase_credentials.json", "firebase.json",
+                    "/etc/secrets/serviceAccountKey.json", "/etc/secrets/firebase_key.json", "/etc/secrets/firebase-credentials.json", "/etc/secrets/firebase_credentials.json", "/etc/secrets/firebase.json"
+                ]
+                # Détection automatique de tout fichier JSON dans /etc/secrets
+                if os.path.exists("/etc/secrets"):
+                    try:
+                        for sf in os.listdir("/etc/secrets"):
+                            if sf.endswith(".json"):
+                                json_candidates.append(os.path.join("/etc/secrets", sf))
+                    except Exception:
+                        pass
+
+                for p in json_candidates:
                     if os.path.exists(p):
-                        cred = credentials.Certificate(p)
-                        firebase_admin.initialize_app(cred)
-                        _FIRESTORE_CLIENT = firestore.client()
-                        return _FIRESTORE_CLIENT
+                        try:
+                            cred = credentials.Certificate(p)
+                            firebase_admin.initialize_app(cred)
+                            _FIRESTORE_CLIENT = firestore.client()
+                            print(f"[PermutStage] Firestore initialisé depuis fichier JSON : {p}")
+                            return _FIRESTORE_CLIENT
+                        except Exception as e_cert:
+                            print(f"[PermutStage] Erreur fichier {p}: {e_cert}")
 
             if fb_creds_dict:
                 if "private_key" in fb_creds_dict and isinstance(fb_creds_dict["private_key"], str):
@@ -618,6 +649,7 @@ def get_firestore_client():
                 cred = credentials.Certificate(fb_creds_dict)
                 firebase_admin.initialize_app(cred)
                 _FIRESTORE_CLIENT = firestore.client()
+                print("[PermutStage] Firestore initialisé avec succès depuis le dictionnaire de credentials !")
                 return _FIRESTORE_CLIENT
 
             # Aucun appel à firebase_admin.initialize_app() vide pour éviter le timeout de 20s sur Render
@@ -2631,11 +2663,11 @@ def get(session, req: Request = None):
         render_footer()
     )
 
-@rt("/login")
-async def login_post(session, req: Request):
+@rt("/login", methods=["POST"])
+async def login_route(session, req: Request):
     form_data = await req.form()
-    em_clean = str(form_data.get("email") or "").strip().lower()
-    input_pin = normalize_pin(str(form_data.get("pin") or form_data.get("code_pin") or ""))
+    em_clean = str(form_data.get("email", "")).strip().lower()
+    input_pin = normalize_pin(str(form_data.get("pin", "") or form_data.get("code_pin", "")).strip())
 
     if not em_clean or not input_pin:
         return Article(
@@ -2644,7 +2676,12 @@ async def login_post(session, req: Request):
         )
 
     # Vérification directe dans Firestore
-    user_doc = get_user_by_email(em_clean)
+    try:
+        user_doc = get_user_by_email(em_clean)
+    except Exception as exc:
+        logger.error(f"[PermutStage] Erreur lors de la vérification de compte: {exc}")
+        user_doc = None
+
     if not user_doc:
         return Article(
             P("⚠️ Compte introuvable, veuillez vous inscrire.", style="color:#b91c1c; font-weight:700; margin:0;"),
@@ -2686,15 +2723,18 @@ async def login_post(session, req: Request):
         style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
     )
 
-@rt("/inscription")
-@rt("/register")
-async def inscription_post(session, req: Request):
+@rt("/login", methods=["GET"])
+def login_get(session):
+    return RedirectResponse("/login-view")
+
+@rt("/inscription", methods=["POST"])
+@rt("/register", methods=["POST"])
+async def inscription_route(session, req: Request):
     form_data = await req.form()
-    clean_prenom = str(form_data.get("prenom") or "").strip()
-    clean_nom = str(form_data.get("nom") or "").strip()
-    clean_email = str(form_data.get("email") or "").strip().lower()
-    raw_pin = str(form_data.get("pin") or form_data.get("code_pin") or "").strip()
-    clean_pin = normalize_pin(raw_pin)
+    clean_prenom = str(form_data.get("prenom", "")).strip()
+    clean_nom = str(form_data.get("nom", "")).strip()
+    clean_email = str(form_data.get("email", "")).strip().lower()
+    clean_pin = normalize_pin(str(form_data.get("pin", "") or form_data.get("code_pin", "")).strip())
 
     # 1. Validation assouplie : Prénom et Nom dès 1 caractère
     if len(clean_prenom) < 1:
@@ -2788,6 +2828,11 @@ async def inscription_post(session, req: Request):
         """),
         style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1.25rem; border-radius:12px; margin-bottom:1.5rem;"
     )
+
+@rt("/inscription", methods=["GET"])
+@rt("/register", methods=["GET"])
+def inscription_get(session):
+    return RedirectResponse("/login-view")
 
 @rt("/forgot-pin-view")
 def get(session, req: Request = None):
