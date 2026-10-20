@@ -2681,11 +2681,30 @@ def get(session, req: Request = None):
         render_footer()
     )
 
-@rt("/login", methods=["POST"])
-async def login_route(session, req: Request):
-    form_data = await req.form()
-    em_clean = str(form_data.get("email", "")).strip().lower()
-    input_pin = normalize_pin(str(form_data.get("pin", "") or form_data.get("code_pin", "")).strip())
+def handle_login(session, email: str = "", pin: str = "", code_pin: str = "", req: Request = None):
+    em_clean = str(email or "").strip().lower()
+    input_pin = normalize_pin(str(pin or code_pin or "").strip())
+
+    if req is not None:
+        rf = getattr(req, "_form", None)
+        if rf:
+            em_clean = em_clean or str(rf.get("email", "")).strip().lower()
+            input_pin = input_pin or normalize_pin(str(rf.get("pin", "") or rf.get("code_pin", "")).strip())
+        qp = getattr(req, "query_params", None)
+        if qp:
+            em_clean = em_clean or str(qp.get("email", "")).strip().lower()
+            input_pin = input_pin or normalize_pin(str(qp.get("pin", "") or qp.get("code_pin", "")).strip())
+        if hasattr(req, "_body") and req._body:
+            try:
+                from urllib.parse import parse_qs
+                parsed = parse_qs(req._body.decode("utf-8", errors="ignore"))
+                if not em_clean and "email" in parsed:
+                    em_clean = str(parsed["email"][0]).strip().lower()
+                if not input_pin and ("pin" in parsed or "code_pin" in parsed):
+                    raw_p = parsed.get("pin", parsed.get("code_pin", [""]))[0]
+                    input_pin = normalize_pin(str(raw_p).strip())
+            except Exception:
+                pass
 
     if not em_clean or not input_pin:
         return Article(
@@ -2741,18 +2760,49 @@ async def login_route(session, req: Request):
         style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
     )
 
-@rt("/login", methods=["GET"])
-def login_get(session):
+@rt("/login")
+def post(session, email: str = "", pin: str = "", code_pin: str = "", req: Request = None):
+    return handle_login(session, email=email, pin=pin, code_pin=code_pin, req=req)
+
+@rt("/login")
+def get(session):
     return RedirectResponse("/login-view")
 
-@rt("/inscription", methods=["POST"])
-@rt("/register", methods=["POST"])
-async def inscription_route(session, req: Request):
-    form_data = await req.form()
-    clean_prenom = str(form_data.get("prenom", "")).strip()
-    clean_nom = str(form_data.get("nom", "")).strip()
-    clean_email = str(form_data.get("email", "")).strip().lower()
-    clean_pin = normalize_pin(str(form_data.get("pin", "") or form_data.get("code_pin", "")).strip())
+
+def handle_inscription(session, prenom: str = "", nom: str = "", email: str = "", pin: str = "", code_pin: str = "", req: Request = None):
+    clean_prenom = str(prenom or "").strip()
+    clean_nom = str(nom or "").strip()
+    clean_email = str(email or "").strip().lower()
+    clean_pin = normalize_pin(str(pin or code_pin or "").strip())
+
+    if req is not None:
+        rf = getattr(req, "_form", None)
+        if rf:
+            clean_prenom = clean_prenom or str(rf.get("prenom", "")).strip()
+            clean_nom = clean_nom or str(rf.get("nom", "")).strip()
+            clean_email = clean_email or str(rf.get("email", "")).strip().lower()
+            clean_pin = clean_pin or normalize_pin(str(rf.get("pin", "") or rf.get("code_pin", "")).strip())
+        qp = getattr(req, "query_params", None)
+        if qp:
+            clean_prenom = clean_prenom or str(qp.get("prenom", "")).strip()
+            clean_nom = clean_nom or str(qp.get("nom", "")).strip()
+            clean_email = clean_email or str(qp.get("email", "")).strip().lower()
+            clean_pin = clean_pin or normalize_pin(str(qp.get("pin", "") or qp.get("code_pin", "")).strip())
+        if hasattr(req, "_body") and req._body:
+            try:
+                from urllib.parse import parse_qs
+                parsed = parse_qs(req._body.decode("utf-8", errors="ignore"))
+                if not clean_prenom and "prenom" in parsed:
+                    clean_prenom = str(parsed["prenom"][0]).strip()
+                if not clean_nom and "nom" in parsed:
+                    clean_nom = str(parsed["nom"][0]).strip()
+                if not clean_email and "email" in parsed:
+                    clean_email = str(parsed["email"][0]).strip().lower()
+                if not clean_pin and ("pin" in parsed or "code_pin" in parsed):
+                    raw_p = parsed.get("pin", parsed.get("code_pin", [""]))[0]
+                    clean_pin = normalize_pin(str(raw_p).strip())
+            except Exception:
+                pass
 
     print(f"[PermutStage Inscription] 📩 Requête POST reçue : prenom='{clean_prenom}', nom='{clean_nom}', email='{clean_email}'")
 
@@ -2854,9 +2904,20 @@ async def inscription_route(session, req: Request):
         style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1.25rem; border-radius:12px; margin-bottom:1.5rem;"
     )
 
-@rt("/inscription", methods=["GET"])
-@rt("/register", methods=["GET"])
-def inscription_get(session):
+@rt("/inscription")
+def post(session, prenom: str = "", nom: str = "", email: str = "", pin: str = "", code_pin: str = "", req: Request = None):
+    return handle_inscription(session, prenom=prenom, nom=nom, email=email, pin=pin, code_pin=code_pin, req=req)
+
+@rt("/inscription")
+def get(session):
+    return RedirectResponse("/login-view")
+
+@rt("/register")
+def post(session, prenom: str = "", nom: str = "", email: str = "", pin: str = "", code_pin: str = "", req: Request = None):
+    return handle_inscription(session, prenom=prenom, nom=nom, email=email, pin=pin, code_pin=code_pin, req=req)
+
+@rt("/register")
+def get(session):
     return RedirectResponse("/login-view")
 
 @rt("/forgot-pin-view")
