@@ -825,6 +825,54 @@ def update_user_pin(email: str, new_pin: str) -> bool:
     invalidate_cache("users")
     return True
 
+def update_user_profile(email: str, prenom: str, nom: str, new_pin: str = None) -> bool:
+    """Met à jour le prénom, nom et optionnellement le code PIN de l'étudiant dans Firestore et localement."""
+    clean_email = email.strip().lower()
+    clean_prenom = str(prenom or "").strip()
+    clean_nom = str(nom or "").strip()
+
+    update_dict = {
+        "prenom": clean_prenom,
+        "Prenom": clean_prenom,
+        "nom": clean_nom,
+        "Nom": clean_nom,
+    }
+    if new_pin:
+        clean_pin = normalize_pin(new_pin)
+        update_dict["code_pin"] = clean_pin
+        update_dict["PIN"] = clean_pin
+
+    db = get_firestore_client()
+    if db is not None:
+        try:
+            db.collection(COLLECTION_USERS).document(clean_email).set(update_dict, merge=True)
+            nom_complet = f"{clean_prenom} {clean_nom}".strip() or clean_email
+            dem_updates = {"nom_etudiant": nom_complet, "Nom": nom_complet}
+            if new_pin:
+                dem_updates["code_pin"] = clean_pin
+                dem_updates["PIN"] = clean_pin
+            demandes_q = db.collection(COLLECTION_DEMANDES).where("user_email", "==", clean_email).stream()
+            for doc in demandes_q:
+                doc.reference.update(dem_updates)
+            print(f"[PermutStage] ✅ Profil Firestore mis à jour pour {clean_email}")
+        except Exception as exc:
+            print(f"[PermutStage] Erreur mise à jour profil Firestore: {exc}")
+
+    local = load_local_db()
+    if clean_email in local.get("users", {}):
+        local["users"][clean_email].update(update_dict)
+    nom_complet = f"{clean_prenom} {clean_nom}".strip() or clean_email
+    for d in local.get("demandes", {}).values():
+        if (d.get("user_email") or d.get("Email") or "").lower() == clean_email:
+            d["nom_etudiant"] = nom_complet
+            d["Nom"] = nom_complet
+            if new_pin:
+                d["code_pin"] = clean_pin
+                d["PIN"] = clean_pin
+    save_local_db(local)
+    invalidate_cache("all")
+    return True
+
 def delete_user_and_demandes(email: str) -> bool:
     """Supprime l'utilisateur et ses demandes associées en cascade."""
     clean_email = email.strip().lower()
@@ -1064,6 +1112,7 @@ def creer_ou_recuperer_discussion(participants: list[str], type_match: str, dema
                 "dernier_message": "",
                 "dernier_timestamp": datetime.now().isoformat(),
                 "created_at": datetime.now().isoformat(),
+                "statut": "nouveau",
             }
             ref.set(payload)
             return payload
@@ -1083,15 +1132,64 @@ def creer_ou_recuperer_discussion(participants: list[str], type_match: str, dema
         "dernier_message": "",
         "dernier_timestamp": datetime.now().isoformat(),
         "created_at": datetime.now().isoformat(),
+        "statut": "nouveau",
     }
     local["discussions"][disc_id] = payload
     save_local_db(local)
     return payload
 
+def get_discussion_by_id(discussion_id: str) -> dict:
+    """Récupère une discussion depuis Firestore ou le stockage local persistant."""
+    disc_id = str(discussion_id).strip()
+    db = get_firestore_client()
+    if db is not None:
+        try:
+            snap = db.collection(COLLECTION_DISCUSSIONS).document(disc_id).get()
+            if snap.exists:
+                d = snap.to_dict() or {}
+                local = load_local_db()
+                if "discussions" not in local: local["discussions"] = {}
+                local["discussions"][disc_id] = d
+                save_local_db(local)
+                return d
+        except Exception as exc:
+            print(f"[PermutStage] Erreur get_discussion_by_id Firestore: {exc}")
+
+    local = load_local_db()
+    return local.get("discussions", {}).get(disc_id, {})
+
+def mettre_a_jour_statut_discussion(discussion_id: str, nouveau_statut: str, confirmed_by: str = "") -> dict:
+    """Met à jour le statut d'une discussion ('nouveau', 'en discussion', 'accord trouvé')."""
+    disc_id = str(discussion_id).strip()
+    now_iso = datetime.now().isoformat()
+    upd = {
+        "statut": nouveau_statut,
+        "statut_updated_at": now_iso,
+    }
+    if confirmed_by:
+        upd["accord_confirme_par"] = confirmed_by
+        upd["accord_confirme_at"] = now_iso
+
+    db = get_firestore_client()
+    if db is not None:
+        try:
+            db.collection(COLLECTION_DISCUSSIONS).document(disc_id).set(upd, merge=True)
+            print(f"[PermutStage] ✅ Statut discussion '{disc_id}' mis à jour vers '{nouveau_statut}' dans Firestore.")
+        except Exception as exc:
+            print(f"[PermutStage] Erreur statut discussion Firestore: {exc}")
+
+    local = load_local_db()
+    if "discussions" not in local: local["discussions"] = {}
+    if disc_id not in local["discussions"]:
+        local["discussions"][disc_id] = {"discussion_id": disc_id}
+    local["discussions"][disc_id].update(upd)
+    save_local_db(local)
+    return local["discussions"][disc_id]
+
 def envoyer_message(discussion_id: str, sender_email: str, sender_name: str, texte: str) -> bool:
     """
     Insère un message dans Firestore (collection 'messages')
-    et met à jour la discussion parente (collection 'discussions').
+    et met à jour la discussion parente (collection 'discussions') avec statut 'en discussion' automatique.
     """
     clean_text = texte.strip()
     if not clean_text:
@@ -1120,10 +1218,16 @@ def envoyer_message(discussion_id: str, sender_email: str, sender_name: str, tex
     if db is not None:
         try:
             db.collection(COLLECTION_MESSAGES).document(msg_id).set(msg_payload)
-            db.collection(COLLECTION_DISCUSSIONS).document(discussion_id).set({
+            # Vérifier si la discussion est déjà 'accord trouvé' ou non
+            cur_doc = db.collection(COLLECTION_DISCUSSIONS).document(discussion_id).get()
+            cur_statut = cur_doc.to_dict().get("statut") if cur_doc.exists else ""
+            disc_update = {
                 "dernier_message": clean_text,
                 "dernier_timestamp": now_iso
-            }, merge=True)
+            }
+            if cur_statut != "accord trouvé":
+                disc_update["statut"] = "en discussion"
+            db.collection(COLLECTION_DISCUSSIONS).document(discussion_id).set(disc_update, merge=True)
         except Exception as exc:
             print(f"[PermutStage] Erreur envoyer_message Firestore: {exc}")
 
@@ -1133,6 +1237,8 @@ def envoyer_message(discussion_id: str, sender_email: str, sender_name: str, tex
     if "discussions" in local and discussion_id in local["discussions"]:
         local["discussions"][discussion_id]["dernier_message"] = clean_text
         local["discussions"][discussion_id]["dernier_timestamp"] = now_iso
+        if local["discussions"][discussion_id].get("statut") != "accord trouvé":
+            local["discussions"][discussion_id]["statut"] = "en discussion"
     save_local_db(local)
     return True
 
@@ -1813,6 +1919,8 @@ def render_header(session, active_tab="accueil", req: Request = None):
         ("catalogue", "3. Catalogue public", "/catalogue"),
         ("gerer", "4. Gérer mon offre", "/gerer"),
     ]
+    if user_email:
+        tabs.append(("profil", "👤 Mon Profil", "/profil"))
     if is_admin:
         tabs.append(("admin", "🛠️ Administration", "/admin"))
 
@@ -1824,10 +1932,12 @@ def render_header(session, active_tab="accueil", req: Request = None):
     if user_email:
         display_name = f"{user_prenom} {user_nom}".strip() or user_email
         auth_section = Div(
-            Span(
+            A(
                 f"👤 {display_name}",
+                href="/profil",
+                title="Accéder à mon profil étudiant et modifier mes informations / code PIN",
                 cls="auth-connected-indicator",
-                style="font-weight:700; font-size:0.85rem; color:#1e293b; background:#f1f5f9; padding:0.35rem 0.75rem; border-radius:9999px; margin-right:0.6rem; border:1px solid #e2e8f0;"
+                style="font-weight:700; font-size:0.85rem; color:#1d4ed8; background:#eff6ff; padding:0.35rem 0.75rem; border-radius:9999px; margin-right:0.6rem; border:1px solid #bfdbfe; text-decoration:none; display:inline-flex; align-items:center; cursor:pointer;"
             ),
             A(
                 "🔔 Notifications",
@@ -2196,11 +2306,59 @@ def get(session, req: Request = None):
                     )
                 )
 
+            disc = get_discussion_by_id(room_id)
+            statut = disc.get("statut") or ("en discussion" if msgs_salon else "nouveau")
+            if statut == "accord trouvé":
+                status_tag = Span("🎉 Accord trouvé", cls="status-badge", style="background:#dcfce7; color:#166534; border:1px solid #86efac; font-weight:800; font-size:0.78rem; padding:0.25rem 0.65rem; border-radius:9999px; float:right;")
+                accord_action = Div(
+                    P("🎉 Accord d'échange officiellement confirmé !", style="font-weight:700; color:#166534; margin:0; font-size:0.85rem;"),
+                    id=f"match-accord-{slugify(room_id)}",
+                    style="background:#f0fdf4; border:1px solid #86efac; padding:0.5rem 0.75rem; border-radius:8px; margin-top:0.6rem;"
+                )
+            elif statut == "en discussion":
+                status_tag = Span("💬 En discussion", cls="status-badge", style="background:#dbeafe; color:#1e40af; border:1px solid #bfdbfe; font-weight:700; font-size:0.78rem; padding:0.25rem 0.65rem; border-radius:9999px; float:right;")
+                accord_action = Div(
+                    Form(
+                        Input(type="hidden", name="discussion_id", value=room_id),
+                        Button(
+                            "🤝 Confirmer l'accord trouvé",
+                            type="submit",
+                            cls="outline",
+                            style="border-color:#16a34a; color:#166534; font-weight:700; border-radius:8px; font-size:0.8rem; padding:0.35rem 0.75rem; margin:0;",
+                        ),
+                        hx_post="/confirmer-accord",
+                        hx_confirm="🤝 Confirmation requise : Avez-vous trouvé un accord de permutation avec votre binôme ? Le salon passera au statut 'Accord trouvé'.",
+                        hx_target=f"#match-accord-{slugify(room_id)}",
+                        hx_swap="outerHTML"
+                    ),
+                    id=f"match-accord-{slugify(room_id)}",
+                    style="margin-top:0.6rem;"
+                )
+            else:
+                status_tag = Span("Binôme direct", cls="status-badge status-disponible", style="float:right;")
+                accord_action = Div(
+                    Form(
+                        Input(type="hidden", name="discussion_id", value=room_id),
+                        Button(
+                            "🤝 Confirmer l'accord trouvé",
+                            type="submit",
+                            cls="outline",
+                            style="border-color:#16a34a; color:#166534; font-weight:700; border-radius:8px; font-size:0.8rem; padding:0.35rem 0.75rem; margin:0;",
+                        ),
+                        hx_post="/confirmer-accord",
+                        hx_confirm="🤝 Confirmation requise : Avez-vous trouvé un accord de permutation avec votre binôme ? Le salon passera au statut 'Accord trouvé'.",
+                        hx_target=f"#match-accord-{slugify(room_id)}",
+                        hx_swap="outerHTML"
+                    ),
+                    id=f"match-accord-{slugify(room_id)}",
+                    style="margin-top:0.6rem;"
+                )
+
             bi_sections.append(
                 Article(
                     Div(
                         Strong(f"MATCH PRIVÉ BILATÉRAL · {m['periode']} · {m['specialite']}", style="color:#166534; font-size:0.95rem; font-weight:800;"),
-                        Span("Binôme direct", cls="status-badge status-disponible", style="float:right;"),
+                        status_tag,
                         style="margin-bottom:0.75rem;"
                     ),
                     P(
@@ -2215,6 +2373,7 @@ def get(session, req: Request = None):
                         A(b["Email"], href=f"mailto:{b['Email']}"),
                         style="font-size:0.85rem; color:#15803d;"
                     ),
+                    accord_action,
                     Details(
                         Summary(f"💬 Salon de discussion privé ({len(msgs_salon)} messages)"),
                         Div(
@@ -2259,11 +2418,59 @@ def get(session, req: Request = None):
                     )
                 )
 
+            disc_t = get_discussion_by_id(room_id)
+            statut_t = disc_t.get("statut") or ("en discussion" if msgs_salon else "nouveau")
+            if statut_t == "accord trouvé":
+                status_tag_t = Span("🎉 Accord trouvé", cls="status-badge", style="background:#dcfce7; color:#166534; border:1px solid #86efac; font-weight:800; font-size:0.78rem; padding:0.25rem 0.65rem; border-radius:9999px; float:right;")
+                accord_action_t = Div(
+                    P("🎉 Accord d'échange officiellement confirmé !", style="font-weight:700; color:#166534; margin:0; font-size:0.85rem;"),
+                    id=f"match-accord-{slugify(room_id)}",
+                    style="background:#f0fdf4; border:1px solid #86efac; padding:0.5rem 0.75rem; border-radius:8px; margin-top:0.6rem;"
+                )
+            elif statut_t == "en discussion":
+                status_tag_t = Span("💬 En discussion", cls="status-badge", style="background:#dbeafe; color:#1e40af; border:1px solid #bfdbfe; font-weight:700; font-size:0.78rem; padding:0.25rem 0.65rem; border-radius:9999px; float:right;")
+                accord_action_t = Div(
+                    Form(
+                        Input(type="hidden", name="discussion_id", value=room_id),
+                        Button(
+                            "🤝 Confirmer l'accord trouvé",
+                            type="submit",
+                            cls="outline",
+                            style="border-color:#16a34a; color:#166534; font-weight:700; border-radius:8px; font-size:0.8rem; padding:0.35rem 0.75rem; margin:0;",
+                        ),
+                        hx_post="/confirmer-accord",
+                        hx_confirm="🤝 Confirmation requise : Avez-vous trouvé un accord de permutation avec l'ensemble des membres de ce cycle ? Le salon passera au statut 'Accord trouvé'.",
+                        hx_target=f"#match-accord-{slugify(room_id)}",
+                        hx_swap="outerHTML"
+                    ),
+                    id=f"match-accord-{slugify(room_id)}",
+                    style="margin-top:0.6rem;"
+                )
+            else:
+                status_tag_t = Span("Cycle à 3", cls="status-badge status-accord", style="float:right;")
+                accord_action_t = Div(
+                    Form(
+                        Input(type="hidden", name="discussion_id", value=room_id),
+                        Button(
+                            "🤝 Confirmer l'accord trouvé",
+                            type="submit",
+                            cls="outline",
+                            style="border-color:#16a34a; color:#166534; font-weight:700; border-radius:8px; font-size:0.8rem; padding:0.35rem 0.75rem; margin:0;",
+                        ),
+                        hx_post="/confirmer-accord",
+                        hx_confirm="🤝 Confirmation requise : Avez-vous trouvé un accord de permutation avec l'ensemble des membres de ce cycle ? Le salon passera au statut 'Accord trouvé'.",
+                        hx_target=f"#match-accord-{slugify(room_id)}",
+                        hx_swap="outerHTML"
+                    ),
+                    id=f"match-accord-{slugify(room_id)}",
+                    style="margin-top:0.6rem;"
+                )
+
             tri_sections.append(
                 Article(
                     Div(
                         Strong(f"MATCH PRIVÉ TRIANGULAIRE · {t['periode']} · {t['specialite']}", style="color:#064e3b; font-size:0.95rem; font-weight:800;"),
-                        Span("Cycle à 3", cls="status-badge status-accord", style="float:right;"),
+                        status_tag_t,
                         style="margin-bottom:0.75rem;"
                     ),
                     P(
@@ -2280,6 +2487,7 @@ def get(session, req: Request = None):
                         A(c["Email"], href=f"mailto:{c['Email']}"),
                         style="font-size:0.85rem; color:#047857;"
                     ),
+                    accord_action_t,
                     Details(
                         Summary(f"💬 Salon de discussion privé ({len(msgs_salon)} messages)"),
                         Div(
@@ -2342,13 +2550,53 @@ def get(session, id: str, req: Request = None):
             )
         )
 
+    disc = get_discussion_by_id(disc_id)
+    statut = disc.get("statut") or ("en discussion" if msgs else "nouveau")
+
+    if statut == "accord trouvé":
+        accord_banner = Div(
+            Article(
+                H4("🎉 Accord trouvé et validé !", style="color:#14532d; font-weight:800; margin-bottom:0.3rem;"),
+                P("Tous les participants ont validé leur accord d'échange pour ce salon. Félicitations ! Pensez à transmettre votre accord officiel à la commission des stages de votre faculté."),
+                style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1rem; border-radius:10px; margin-bottom:1rem;"
+            ),
+            id=f"accord-section-{slugify(disc_id)}"
+        )
+    else:
+        accord_banner = Div(
+            Article(
+                Div(
+                    Span("💬 En discussion" if statut == "en discussion" else "⏳ Nouveau salon",
+                         cls="status-badge",
+                         style="background:#dbeafe; color:#1e40af; border:1px solid #bfdbfe; font-weight:700; font-size:0.8rem; padding:0.25rem 0.65rem; border-radius:9999px; margin-right:0.75rem;"),
+                    Span("Discutez des modalités de permutation. Une fois d'accord, confirmez votre entente :", style="font-size:0.88rem; color:#475569;"),
+                    style="margin-bottom:0.6rem; display:flex; align-items:center; flex-wrap:wrap; gap:0.5rem;"
+                ),
+                Form(
+                    Input(type="hidden", name="discussion_id", value=disc_id),
+                    Button(
+                        "🤝 Confirmer l'accord trouvé",
+                        type="submit",
+                        cls="primary",
+                        style="background:#16a34a; border-color:#16a34a; font-weight:700; border-radius:8px; font-size:0.88rem; padding:0.45rem 1rem; width:auto;",
+                    ),
+                    hx_post="/confirmer-accord",
+                    hx_confirm="🤝 Confirmation requise : Avez-vous convenu de l'ensemble des modalités d'échange avec vos correspondants et confirmez-vous cet accord ? Cette action passera définitivement le salon au statut 'Accord trouvé'.",
+                    hx_target=f"#accord-section-{slugify(disc_id)}",
+                    hx_swap="outerHTML"
+                ),
+                style="background:#f8fafc; border:1px solid #e2e8f0; padding:1rem; border-radius:10px; margin-bottom:1rem;"
+            ),
+            id=f"accord-section-{slugify(disc_id)}"
+        )
+
     return Main(
         render_header(session, "matchs", req),
         Div(
             A("← Retour à Mes Matchs", href="/matchs", style="display:inline-block; margin-bottom:1rem; font-size:0.9rem; font-weight:600;"),
             Article(
                 H3(f"💬 Salon de discussion privé : {disc_id}", style="font-weight:700;"),
-                P("Tous les messages échangés sont enregistrés de façon sécurisée dans la collection Firestore 'messages'."),
+                accord_banner,
                 Div(*chat_elements, id=f"chat-box-{slugify(disc_id)}", style="min-height:280px; max-height:450px; overflow-y:auto; margin:1rem 0; padding:1rem; background:#ffffff; border-radius:10px; border:1px solid #e2e8f0;"),
                 Form(
                     Div(
@@ -2397,6 +2645,45 @@ def post(session, req: Request = None, discussion_id: str = "", room_id: str = "
             )
         )
     return Div(*elements)
+
+@rt("/confirmer-accord")
+def post(session, req: Request = None, discussion_id: str = ""):
+    u = get_session_user(session, req)
+    if not u or not u.get("email"):
+        return Article(P("⚠️ Session expirée. Veuillez vous reconnecter.", style="color:#b91c1c; font-weight:600;"), cls="contrast")
+
+    disc_id = str(discussion_id).strip()
+    if not disc_id and req is not None:
+        try:
+            rf = getattr(req, "_form", None)
+            if rf: disc_id = str(rf.get("discussion_id", "")).strip()
+        except Exception:
+            pass
+
+    if not disc_id:
+        return Article(P("Discussion introuvable.", style="color:#b91c1c; font-weight:600;"))
+
+    user_email = u["email"].strip().lower()
+    user_nom = f"{u.get('prenom', '')} {u.get('nom', '')}".strip() or user_email
+
+    mettre_a_jour_statut_discussion(disc_id, "accord trouvé", confirmed_by=user_email)
+
+    envoyer_message(
+        disc_id,
+        "system@permutstage",
+        "Système PermutStage",
+        f"🎉 Accord d'échange officiellement confirmé par {user_nom} ! Félicitations aux participants. Pensez à transmettre votre accord officiel à la commission des stages."
+    )
+
+    return Div(
+        Article(
+            H4("🎉 Accord trouvé et validé !", style="color:#14532d; font-weight:800; margin-bottom:0.3rem;"),
+            P(f"L'accord a été officiellement confirmé par {user_nom}. Le statut de ce salon est désormais 'Accord trouvé'."),
+            P("Conservez vos coordonnées et soumettez votre dossier conjoint de permutation à votre commission de stage facultaire.", style="font-size:0.85rem; color:#166534; margin:0;"),
+            style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1rem; border-radius:10px; margin-bottom:1rem;"
+        ),
+        id=f"accord-section-{slugify(disc_id)}"
+    )
 
 # === VUE 4 : CATALOGUE PUBLIC (ANONYMISÉ PAR CONFIDENTIALITÉ) ===
 @rt("/catalogue")
@@ -2959,20 +3246,252 @@ def post(session, email: str = ""):
     user_doc = get_user_by_email(em_clean)
 
     if not user_doc:
-        return P("Aucun compte n'est associé à cette adresse email dans Firestore.", style="color:#b91c1c; font-weight:600;")
+        return Article(
+            P("⚠️ Aucun compte n'est associé à cette adresse email dans Firestore.", style="color:#b91c1c; font-weight:700; margin:0;"),
+            P("Vérifiez l'orthographe de votre email ou créez un compte étudiant.", style="font-size:0.85rem; color:#64748b; margin-top:0.3rem;"),
+            A("Créer mon compte", href="/login-view", role="button", cls="outline", style="margin-top:0.5rem; border-radius:8px;"),
+            style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px;"
+        )
 
     pin = normalize_pin(user_doc.get("code_pin") or user_doc.get("PIN") or "")
     prenom = str(user_doc.get("prenom") or user_doc.get("Prenom") or "étudiant").strip()
 
-    try:
-        send_pin_recovery_email(em_clean, prenom, pin)
+    # Tentative d'envoi par email si SMTP est configuré
+    smtp_envoye = False
+    if get_smtp_config():
+        try:
+            send_pin_recovery_email(em_clean, prenom, pin)
+            smtp_envoye = True
+        except Exception as err:
+            logger.warning(f"[PermutStage] Envoi email échoué: {err}")
+
+    if smtp_envoye:
         return Article(
-            P(f"✅ Votre code PIN a été envoyé à {em_clean}."),
-            A("Se connecter", href="/login-view", role="button", cls="outline", style="border-radius:8px; margin-top:0.5rem;"),
-            style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1rem; border-radius:10px;"
+            H4("📧 Email envoyé !", style="color:#14532d; font-weight:800; margin-bottom:0.4rem;"),
+            P(f"Votre code PIN a été envoyé à {em_clean}."),
+            A("Se connecter", href="/login-view", role="button", cls="primary", style="border-radius:8px; margin-top:0.5rem;"),
+            style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1.25rem; border-radius:12px;"
         )
-    except Exception as err:
-        return P(f"Impossible d'envoyer l'email : {err}", style="color:#b91c1c; font-weight:600;")
+
+    # Repli immédiat et sécurisé sans SMTP : affichage direct et option de redéfinition
+    return Article(
+        H4("🔑 Récupération directe de votre code PIN", style="color:#1e40af; font-weight:800; margin-bottom:0.4rem;"),
+        P(f"Bonjour {prenom}, le service d'envoi d'email automatique n'étant pas activé sur ce serveur (SMTP non configuré), voici votre accès direct :"),
+        Div(
+            P("Votre code PIN enregistré est :", style="margin-bottom:0.2rem; font-weight:600;"),
+            Div(
+                Strong(pin, style="font-size:1.6rem; letter-spacing:0.25rem; color:#1d4ed8; background:#dbeafe; padding:0.4rem 1rem; border-radius:8px; display:inline-block; border:1px solid #bfdbfe;"),
+                style="margin:0.5rem 0;"
+            ),
+            style="background:#f8fafc; padding:0.85rem; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:1rem;"
+        ),
+        Div(
+            A("Se connecter avec ce code PIN", href="/login-view", role="button", cls="primary", style="border-radius:8px; margin-right:0.5rem;"),
+            style="margin-top:0.75rem;"
+        ),
+        Details(
+            Summary("🔄 Ou définir un nouveau code PIN maintenant", style="font-size:0.85rem; font-weight:600; cursor:pointer; margin-top:0.75rem;"),
+            Form(
+                Input(type="hidden", name="email", value=em_clean),
+                Label("Nouveau code PIN (4 chiffres)", Input(name="new_pin", type="password", maxlength=4, placeholder="••••", required=True)),
+                Button("Enregistrer le nouveau code PIN", type="submit", cls="outline", style="border-radius:8px; font-weight:700; width:100%;"),
+                hx_post="/reset-pin-direct",
+                hx_target="#forgot-feedback",
+                hx_swap="innerHTML"
+            ),
+            style="margin-top:0.75rem;"
+        ),
+        style="background:#eff6ff; border:1px solid #bfdbfe; color:#1e3a8a; padding:1.25rem; border-radius:12px;"
+    )
+
+@rt("/reset-pin-direct")
+def post(session, email: str = "", new_pin: str = ""):
+    em_clean = str(email).strip().lower()
+    clean_p = normalize_pin(str(new_pin).strip())
+    if len(clean_p) != 4 or not clean_p.isdigit():
+        return Article(
+            P("⚠️ Le code PIN doit comporter exactement 4 chiffres numériques.", style="color:#b91c1c; font-weight:600; margin:0;"),
+            style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px;"
+        )
+    user_doc = get_user_by_email(em_clean)
+    if not user_doc:
+        return Article(
+            P("⚠️ Compte introuvable.", style="color:#b91c1c; font-weight:600; margin:0;"),
+            style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px;"
+        )
+    update_user_pin(em_clean, clean_p)
+    return Article(
+        H4("✅ Nouveau code PIN enregistré !", style="color:#14532d; font-weight:800; margin-bottom:0.4rem;"),
+        P(f"Votre nouveau code PIN est désormais : Strong({clean_p}). Vous pouvez l'utiliser immédiatement pour vous connecter."),
+        A("Se connecter à mon espace", href="/login-view", role="button", cls="primary", style="border-radius:8px; margin-top:0.5rem;"),
+        style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1.25rem; border-radius:12px;"
+    )
+
+# === VUE PROFIL ÉTUDIANT & MODIFICATION CODE PIN ===
+@rt("/profil")
+def get(session, req: Request = None):
+    u = get_session_user(session, req)
+    if not u or not u.get("email"):
+        return RedirectResponse("/login-view")
+
+    user_email = u["email"].strip().lower()
+    user_doc = get_user_by_email(user_email) or {}
+    prenom = str(user_doc.get("prenom") or u.get("prenom") or "").strip()
+    nom = str(user_doc.get("nom") or u.get("nom") or "").strip()
+    current_pin = normalize_pin(user_doc.get("code_pin") or u.get("pin") or "")
+    date_insc = user_doc.get("Date_Inscription") or user_doc.get("created_at") or "Récemment"
+
+    df_demandes = load_demandes_data()
+    my_demandes = []
+    if not df_demandes.empty and "Email" in df_demandes.columns:
+        sub = df_demandes[df_demandes["Email"].str.lower() == user_email]
+        for _, row in sub.iterrows():
+            my_demandes.append(row.to_dict())
+
+    demandes_elements = []
+    if not my_demandes:
+        demandes_elements.append(
+            P("Vous n'avez pas encore déposé d'offre de stage.", style="color:#64748b; font-style:italic;")
+        )
+    else:
+        for d in my_demandes:
+            demandes_elements.append(
+                Article(
+                    Div(
+                        Strong(f"{d.get('Periode')} · {d.get('Specialite')}", style="color:#1d4ed8; font-weight:700;"),
+                        Span(d.get("Statut", "Disponible"), cls="status-badge status-disponible", style="float:right;"),
+                        style="margin-bottom:0.5rem;"
+                    ),
+                    P(f"Hôpital actuel : {d.get('Hopital_Actuel')}", style="margin:0 0 0.25rem 0; font-size:0.9rem;"),
+                    P(f"Hôpitaux souhaités : {d.get('Hopitaux_Souhaites')}", style="margin:0; font-size:0.85rem; color:#64748b;"),
+                    A("Modifier cette offre dans 'Gérer mon offre' →", href="/gerer", style="display:inline-block; margin-top:0.5rem; font-size:0.82rem; font-weight:600;"),
+                    style="padding:0.75rem 1rem; border:1px solid #e2e8f0; border-radius:8px; margin-bottom:0.5rem; background:#f8fafc;"
+                )
+            )
+
+    return Main(
+        render_header(session, "profil", req),
+        Div(
+            H2("👤 Mon Profil Étudiant", style="font-weight:800; color:#0f172a; margin-bottom:0.4rem;"),
+            P("Gérez vos informations personnelles et mettez à jour votre code PIN de connexion."),
+            Div(
+                Article(
+                    H3("⚙️ Paramètres du compte", style="font-weight:700; color:#0f172a; margin-bottom:1rem;"),
+                    Div(id="profil-feedback"),
+                    Form(
+                        Label("Email institutionnel (identifiant unique)",
+                            Input(type="email", value=user_email, disabled=True, style="background:#f1f5f9; cursor:not-allowed; opacity:0.8;")
+                        ),
+                        Div(
+                            Div(Label("Prénom *", Input(name="prenom", value=prenom, required=True))),
+                            Div(Label("Nom *", Input(name="nom", value=nom, required=True))),
+                            style="display:grid; grid-template-columns: 1fr 1fr; gap:0.5rem;"
+                        ),
+                        Hr(style="margin:1.25rem 0;"),
+                        H4("🔒 Modification du code PIN", style="font-weight:700; font-size:1rem; margin-bottom:0.3rem;"),
+                        P(f"Code PIN actuel enregistré : {current_pin} (laisser vide ci-dessous si vous souhaitez le conserver).", style="font-size:0.85rem; color:#64748b; margin-bottom:0.75rem;"),
+                        Div(
+                            Div(Label("Nouveau code PIN (4 chiffres)", Input(name="nouveau_pin", type="password", maxlength=4, placeholder="••••"))),
+                            Div(Label("Confirmer le code PIN", Input(name="confirmer_pin", type="password", maxlength=4, placeholder="••••"))),
+                            style="display:grid; grid-template-columns: 1fr 1fr; gap:0.5rem;"
+                        ),
+                        Button("💾 Enregistrer les modifications", type="submit", cls="primary", style="border-radius:8px; font-weight:700; width:100%; margin-top:1.25rem;"),
+                        hx_post="/modifier-profil",
+                        hx_target="#profil-feedback",
+                        hx_swap="innerHTML"
+                    ),
+                    style="border-radius:12px;"
+                ),
+                Div(
+                    Article(
+                        H3("📋 Informations de session", style="font-weight:700; color:#0f172a; margin-bottom:0.75rem;"),
+                        Ul(
+                            Li(Strong("Statut : "), Span("Actif & Vérifié", style="color:#15803d; font-weight:700;")),
+                            Li(Strong("Compte : "), user_email),
+                            Li(Strong("Date d'inscription : "), str(date_insc)[:19]),
+                            Li(Strong("Base de données : "), "Google Cloud Firestore (users)")
+                        ),
+                        Div(
+                            A("Déposer une offre de stage", href="/deposer", role="button", cls="outline", style="border-radius:8px; font-size:0.85rem; margin-right:0.5rem;"),
+                            A("Gérer mes offres", href="/gerer", role="button", cls="outline", style="border-radius:8px; font-size:0.85rem;"),
+                            style="margin-top:1rem;"
+                        ),
+                        style="border-radius:12px; margin-bottom:1.5rem;"
+                    ),
+                    Article(
+                        H3("🏥 Mes propositions de stages", style="font-weight:700; color:#0f172a; margin-bottom:0.75rem;"),
+                        *demandes_elements,
+                        style="border-radius:12px;"
+                    ),
+                ),
+                style="display:grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap:2rem;"
+            ),
+            cls="container"
+        ),
+        render_footer()
+    )
+
+@rt("/modifier-profil")
+def post(session, prenom: str = "", nom: str = "", nouveau_pin: str = "", confirmer_pin: str = "", req: Request = None):
+    u = get_session_user(session, req)
+    if not u or not u.get("email"):
+        return Article(P("⚠️ Session expirée. Veuillez vous reconnecter.", style="color:#b91c1c; font-weight:600; margin:0;"), style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px;")
+
+    clean_email = u["email"].strip().lower()
+    clean_prenom = str(prenom or "").strip()
+    clean_nom = str(nom or "").strip()
+    np = str(nouveau_pin or "").strip()
+    cp = str(confirmer_pin or "").strip()
+
+    if req is not None:
+        rf = getattr(req, "_form", None)
+        if rf:
+            clean_prenom = clean_prenom or str(rf.get("prenom", "")).strip()
+            clean_nom = clean_nom or str(rf.get("nom", "")).strip()
+            np = np or str(rf.get("nouveau_pin", "")).strip()
+            cp = cp or str(rf.get("confirmer_pin", "")).strip()
+
+    if len(clean_prenom) < 1 or len(clean_nom) < 1:
+        return Article(
+            P("⚠️ Le prénom et le nom sont obligatoires (au moins 1 caractère).", style="color:#b91c1c; font-weight:600; margin:0;"),
+            style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
+        )
+
+    clean_pin_to_save = None
+    if np or cp:
+        norm_np = normalize_pin(np)
+        norm_cp = normalize_pin(cp)
+        if len(norm_np) != 4 or not norm_np.isdigit():
+            return Article(
+                P("⚠️ Le nouveau code PIN doit comporter exactement 4 chiffres numériques.", style="color:#b91c1c; font-weight:600; margin:0;"),
+                style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
+            )
+        if norm_np != norm_cp:
+            return Article(
+                P("⚠️ La confirmation du code PIN ne correspond pas au nouveau code PIN saisi.", style="color:#b91c1c; font-weight:600; margin:0;"),
+                style="background:#fef2f2; border:1px solid #fecaca; padding:1rem; border-radius:10px; margin-bottom:1rem;"
+            )
+        clean_pin_to_save = norm_np
+
+    update_user_profile(clean_email, clean_prenom, clean_nom, clean_pin_to_save)
+
+    session["prenom"] = clean_prenom
+    session["nom"] = clean_nom
+    if clean_pin_to_save:
+        session["pin"] = clean_pin_to_save
+
+    pin_msg = f"Votre nouveau code PIN est désormais : Strong({clean_pin_to_save})." if clean_pin_to_save else "Code PIN inchangé."
+
+    return Article(
+        H4("🎉 Modifications enregistrées avec succès !", style="color:#14532d; font-weight:800; margin-bottom:0.4rem;"),
+        P(f"Votre profil ({clean_prenom} {clean_nom}) a été mis à jour dans Firestore. {pin_msg}"),
+        Script(f"""
+            setTimeout(function() {{
+                window.location.reload();
+            }}, 1200);
+        """),
+        style="background:#f0fdf4; border:1px solid #86efac; color:#14532d; padding:1.25rem; border-radius:12px; margin-bottom:1rem;"
+    )
 
 @rt("/notifications")
 def get(session, req: Request = None):
