@@ -4009,7 +4009,7 @@ def get():
     return Response("OK", media_type="text/plain")
 
 # === VALIDATION DE PROPRIÉTÉ GOOGLE SEARCH CONSOLE (RÉFÉRENCEMENT GOOGLE) ===
-@rt("/googlef15bfd55c9dd0120.html")
+@rt("/googleb26e30d985ea7bf8.html")
 def get():
     return Response("google-site-verification: googleb26e30d985ea7bf8.html", media_type="text/html")
 
