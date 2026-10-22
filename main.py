@@ -1029,10 +1029,46 @@ def parse_hospitals(raw_val) -> list[str]:
         return []
     return [str(h).strip() for h in str(raw_val).split(";") if str(h).strip()]
 
+def serialize_specialites(specialites: list[str]) -> str:
+    """Sérialise une liste de spécialités sous forme de chaîne délimitée par des points-virgules."""
+    return "; ".join([str(s).strip() for s in (specialites or []) if str(s).strip()])
+
+def parse_specialites(raw_val) -> list[str]:
+    """Extrait une liste propre de spécialités depuis une chaîne ou une liste."""
+    if isinstance(raw_val, list):
+        return [str(s).strip() for s in raw_val if str(s).strip()]
+    if not raw_val or pd.isna(raw_val):
+        return []
+    return [str(s).strip() for s in str(raw_val).split(";") if str(s).strip()]
+
+def wants_specialite(demande_rec: dict, target_specialite: str) -> bool:
+    """
+    Vérifie si le demandeur 'demande_rec' accepte la spécialité 'target_specialite'.
+    - Si 'Peu importe / Toutes les spécialités' (ou 'Peu importe', 'Toutes') est présent : accepte toute spécialité.
+    - Si une liste précise est sélectionnée : vérifie si target_specialite s'y trouve.
+    - Rétrocompatibilité : si aucune spécialité souhaitée n'est définie (anciennes offres),
+      considère que l'étudiant ne souhaite que sa propre spécialité actuelle.
+    """
+    raw_wants = demande_rec.get("specialites_souhaitees") or demande_rec.get("Specialites_Souhaitees")
+    wants_list = parse_specialites(raw_wants) if raw_wants else []
+
+    # Rétrocompatibilité stricte pour les anciennes offres
+    if not wants_list:
+        cur_spec = str(demande_rec.get("specialite") or demande_rec.get("Specialite") or "").strip().lower()
+        return cur_spec == str(target_specialite or "").strip().lower()
+
+    for w in wants_list:
+        w_lower = w.strip().lower()
+        if "peu importe" in w_lower or "toutes" in w_lower or "indifférent" in w_lower or "indifferent" in w_lower:
+            return True
+
+    target_clean = str(target_specialite or "").strip().lower()
+    return any(w.strip().lower() == target_clean for w in wants_list)
+
 def save_demande(demande_dict: dict) -> bool:
     """
     Enregistre ou met à jour une offre de permutation dans la collection 'demandes'.
-    Champs : user_email, nom_etudiant, periode, specialite, hopital_actuel, hopitaux_souhaites, statut, updated_at.
+    Champs : user_email, nom_etudiant, periode, specialite, hopital_actuel, hopitaux_souhaites, specialites_souhaitees, statut, updated_at.
     """
     user_email = demande_dict.get("user_email") or demande_dict.get("Email") or ""
     user_email = str(user_email).strip().lower()
@@ -1044,6 +1080,15 @@ def save_demande(demande_dict: dict) -> bool:
     nom_etudiant = demande_dict.get("nom_etudiant") or demande_dict.get("Nom") or user_email
     specialite = demande_dict.get("specialite") or demande_dict.get("Specialite") or ""
     hopital_actuel = demande_dict.get("hopital_actuel") or demande_dict.get("Hopital_Actuel") or ""
+
+    raw_spec_souhaites = demande_dict.get("specialites_souhaitees") or demande_dict.get("Specialites_Souhaitees") or []
+    s_list = parse_specialites(raw_spec_souhaites)
+    if not s_list:
+        if periode in ("P1", "P2"):
+            s_list = ["Peu importe / Toutes les spécialités"]
+        elif specialite:
+            s_list = [specialite]
+
     statut = (demande_dict.get("statut") or demande_dict.get("Statut") or "disponible").lower()
     if statut in ("disponible", "actif"): statut_clean = "disponible"
     elif statut in ("en_discussion", "en discussion", "en_cours"): statut_clean = "en_cours"
@@ -1067,6 +1112,8 @@ def save_demande(demande_dict: dict) -> bool:
         "Hopital_Actuel": hopital_actuel,
         "hopitaux_souhaites": h_list,
         "Hopitaux_Souhaites": serialize_hospitals(h_list),
+        "specialites_souhaitees": s_list,
+        "Specialites_Souhaitees": serialize_specialites(s_list),
         "statut": statut_clean,
         "Statut": "Disponible" if statut_clean == "disponible" else ("En discussion" if statut_clean == "en_cours" else "Accord trouvé"),
         "updated_at": now_iso,
@@ -1136,6 +1183,12 @@ def load_demandes_data(force_refresh: bool = False) -> pd.DataFrame:
                 h_list = parse_hospitals(item.get("hopitaux_souhaites") or item.get("Hopitaux_Souhaites") or [])
                 item["hopitaux_souhaites"] = h_list
                 item["Hopitaux_Souhaites"] = serialize_hospitals(h_list)
+                spec_raw = item.get("specialites_souhaitees") or item.get("Specialites_Souhaitees")
+                s_list = parse_specialites(spec_raw)
+                if not s_list and item.get("specialite"):
+                    s_list = [item["specialite"]]
+                item["specialites_souhaitees"] = s_list
+                item["Specialites_Souhaitees"] = serialize_specialites(s_list)
                 st = str(item.get("statut") or item.get("Statut") or "disponible").lower()
                 item["statut"] = "disponible" if st in ("disponible", "actif") else ("en_cours" if st in ("en_discussion", "en discussion", "en_cours") else "conclue")
                 item["Statut"] = "Disponible" if item["statut"] == "disponible" else ("En discussion" if item["statut"] == "en_cours" else "Accord trouvé")
@@ -1149,13 +1202,18 @@ def load_demandes_data(force_refresh: bool = False) -> pd.DataFrame:
         local = load_local_db()
         demandes_list = list(local.get("demandes", {}).values())
 
-    cols = ["Demande_ID", "Timestamp", "Nom", "Email", "Periode", "Specialite", "Hopital_Actuel", "Hopitaux_Souhaites", "Statut", "user_email", "nom_etudiant", "hopitaux_souhaites", "updated_at"]
+    cols = ["Demande_ID", "Timestamp", "Nom", "Email", "Periode", "Specialite", "Hopital_Actuel", "Hopitaux_Souhaites", "Statut", "user_email", "nom_etudiant", "hopitaux_souhaites", "updated_at", "specialites_souhaitees", "Specialites_Souhaitees"]
     if not demandes_list:
         df = pd.DataFrame(columns=cols)
     else:
         df = pd.DataFrame(demandes_list)
         for c in cols:
             if c not in df.columns: df[c] = ""
+        # Rétrocompatibilité : s'assurer que chaque ligne a une liste pour specialites_souhaitees
+        for idx in range(len(df)):
+            val = df.at[idx, "specialites_souhaitees"]
+            if not isinstance(val, list):
+                df.at[idx, "specialites_souhaitees"] = parse_specialites(val) or [df.at[idx, "Specialite"]]
 
     _CACHE_DEMANDES["df"] = df.copy()
     _CACHE_DEMANDES["timestamp"] = now
@@ -1431,11 +1489,15 @@ def compute_bilateral_matches(df: pd.DataFrame) -> list[dict]:
                 continue
 
             # Condition 2 : Règle de spécialité
-            # - P1 et P2 (Master 1) : échange libre entre n'importe quelles spécialités
+            # - P1 et P2 (Master 1) : échange selon les spécialités souhaitées croisées (ou joker 'Peu importe')
             # - P3 à P8 (Master 2) : spécialité strictement identique obligatoire
             is_m1 = a["Periode"] in ("P1", "P2")
-            if not is_m1 and a["Specialite"] != b["Specialite"]:
-                continue
+            if not is_m1:
+                if a["Specialite"] != b["Specialite"]:
+                    continue
+            else:
+                if not (wants_specialite(a, b["Specialite"]) and wants_specialite(b, a["Specialite"])):
+                    continue
 
             # Condition 3 : Hôpitaux différents et réciprocité des vœux
             if a["Hopital_Actuel"] == b["Hopital_Actuel"]:
@@ -1494,8 +1556,13 @@ def compute_triangular_matches(df: pd.DataFrame) -> list[dict]:
 
             # Règle de spécialité P1/P2 vs P3-P8
             is_m1 = a["Periode"] in ("P1", "P2")
-            if not is_m1 and a["Specialite"] != b["Specialite"]:
-                continue
+            if not is_m1:
+                if a["Specialite"] != b["Specialite"]:
+                    continue
+            else:
+                # B reçoit le stage de A
+                if not wants_specialite(b, a["Specialite"]):
+                    continue
 
             if a["Hopital_Actuel"] == b["Hopital_Actuel"]:
                 continue
@@ -1509,8 +1576,13 @@ def compute_triangular_matches(df: pd.DataFrame) -> list[dict]:
                 if c["Periode"] != a["Periode"]:
                     continue
 
-                if not is_m1 and (c["Specialite"] != a["Specialite"] or c["Specialite"] != b["Specialite"]):
-                    continue
+                if not is_m1:
+                    if c["Specialite"] != a["Specialite"] or c["Specialite"] != b["Specialite"]:
+                        continue
+                else:
+                    # C reçoit B, et A reçoit C
+                    if not (wants_specialite(c, b["Specialite"]) and wants_specialite(a, c["Specialite"])):
+                        continue
 
                 if (
                     c["Hopital_Actuel"] == a["Hopital_Actuel"]
@@ -1561,7 +1633,7 @@ def compute_quadrangular_matches(df: pd.DataFrame) -> list[dict]:
     Détecte les cycles de permutation quadrangulaires à 4 personnes (A → B → C → D → A).
     Conditions :
     1. Même période pour les 4 participants.
-    2. Règle de spécialité : libre en P1/P2 (Master 1), strictement identique de P3 à P8 (Master 2).
+    2. Règle de spécialité : croisée avec vœux acceptés en P1/P2 (Master 1), strictement identique de P3 à P8 (Master 2).
     3. Hôpitaux actuels tous mutuellement distincts (pas de doublon parmi les 4).
     4. Chaîne cyclique complète d'acceptation : A -> B -> C -> D -> A.
     5. Dédoublonnage canonique strict sur les 4 rotations circulaires possibles.
@@ -1595,8 +1667,14 @@ def compute_quadrangular_matches(df: pd.DataFrame) -> list[dict]:
             b = records[j]
             if b["Periode"] != p_a:
                 continue
-            if not is_m1 and b["Specialite"] != a["Specialite"]:
-                continue
+            if not is_m1:
+                if b["Specialite"] != a["Specialite"]:
+                    continue
+            else:
+                # B reçoit le stage de A
+                if not wants_specialite(b, a["Specialite"]):
+                    continue
+
             h_b = b["Hopital_Actuel"]
             if h_b == h_a or h_a not in souhaites_map[j]:
                 continue
@@ -1607,8 +1685,14 @@ def compute_quadrangular_matches(df: pd.DataFrame) -> list[dict]:
                 c = records[k]
                 if c["Periode"] != p_a:
                     continue
-                if not is_m1 and c["Specialite"] != a["Specialite"]:
-                    continue
+                if not is_m1:
+                    if c["Specialite"] != a["Specialite"]:
+                        continue
+                else:
+                    # C reçoit le stage de B
+                    if not wants_specialite(c, b["Specialite"]):
+                        continue
+
                 h_c = c["Hopital_Actuel"]
                 if h_c in (h_a, h_b) or h_b not in souhaites_map[k]:
                     continue
@@ -1619,8 +1703,14 @@ def compute_quadrangular_matches(df: pd.DataFrame) -> list[dict]:
                     d = records[l]
                     if d["Periode"] != p_a:
                         continue
-                    if not is_m1 and d["Specialite"] != a["Specialite"]:
-                        continue
+                    if not is_m1:
+                        if d["Specialite"] != a["Specialite"]:
+                            continue
+                    else:
+                        # D reçoit C, et A reçoit D
+                        if not (wants_specialite(d, c["Specialite"]) and wants_specialite(a, d["Specialite"])):
+                            continue
+
                     h_d = d["Hopital_Actuel"]
                     if h_d in (h_a, h_b, h_c):
                         continue
@@ -1998,8 +2088,148 @@ def send_first_message_notification(discussion_id: str, sender_email: str, sende
             logger.warning(f"[PermutStage] Échec envoi notification premier message à {dest_email}: {exc}")
 
 # ---------------------------------------------------------------------------
-# 9. COMPOSANT CHECKBOX HÔPITAUX SOUHAITÉS AVEC SÉLECTION PAR PROVINCE
+# 9. COMPOSANTS DE SÉLECTION : SPÉCIALITÉS SOUHAITÉES (P1/P2) & HÔPITAUX
 # ---------------------------------------------------------------------------
+def render_specialites_souhaitees_selector(
+    selected_specs: list[str] = None,
+    current_periode: str = "P1",
+    prefix: str = "depot",
+):
+    """
+    Composant moderne de sélection des spécialités souhaitées en retour pour Master 1 (P1 & P2).
+    - Visible et actif uniquement si Période = 'P1' ou 'P2' (masqué pour P3 à P8).
+    - Inclut l'option 'Peu importe / Toutes les spécialités' (joker).
+    - Propose la liste complète des 6 spécialités du Tronc commun et des 24 Stages au choix.
+    """
+    sel_list = [str(s).strip() for s in (selected_specs or []) if str(s).strip()]
+    sel_set = set(sel_list)
+
+    is_peu_importe = any(
+        ("peu importe" in s.lower() or "toutes" in s.lower())
+        for s in sel_list
+    ) or (not sel_list and str(current_periode).strip() in ("P1", "P2") and prefix == "depot")
+
+    tc_items = []
+    for s in SPECIALITES_TRONC_COMMUN:
+        is_chk = (s in sel_set) and not is_peu_importe
+        tc_items.append(
+            Label(
+                Input(
+                    type="checkbox",
+                    name="specialites_souhaitees",
+                    value=s,
+                    checked=is_chk,
+                    cls=f"spec-cb-{prefix}",
+                    onchange=f"onSpecificSpecialiteChange('{prefix}')",
+                    style="accent-color:#1d4ed8; width:1.15rem; height:1.15rem; margin:0;"
+                ),
+                Span(s, style="font-size:0.86rem; color:#1e293b; font-weight:500;"),
+                style="display:flex; align-items:center; gap:0.45rem; margin-bottom:0.35rem; cursor:pointer;"
+            )
+        )
+
+    choix_items = []
+    for s in SPECIALITES_AU_CHOIX:
+        is_chk = (s in sel_set) and not is_peu_importe
+        choix_items.append(
+            Label(
+                Input(
+                    type="checkbox",
+                    name="specialites_souhaitees",
+                    value=s,
+                    checked=is_chk,
+                    cls=f"spec-cb-{prefix}",
+                    onchange=f"onSpecificSpecialiteChange('{prefix}')",
+                    style="accent-color:#1d4ed8; width:1.15rem; height:1.15rem; margin:0;"
+                ),
+                Span(s, style="font-size:0.86rem; color:#1e293b; font-weight:500;"),
+                style="display:flex; align-items:center; gap:0.45rem; margin-bottom:0.35rem; cursor:pointer;"
+            )
+        )
+
+    js_script = Script(f"""
+    function updateSpecialitesSouhaiteesVisibility(periodeVal, prefix) {{
+        const wrapper = document.getElementById('specialites-souhaitees-wrapper-' + prefix);
+        if (!wrapper) return;
+        if (periodeVal === 'P1' || periodeVal === 'P2') {{
+            wrapper.style.display = 'block';
+        }} else {{
+            wrapper.style.display = 'none';
+        }}
+    }}
+    function togglePeuImporteSpecialites(prefix) {{
+        const masterCb = document.getElementById('spec-peu-importe-' + prefix);
+        if (!masterCb) return;
+        const cbs = document.querySelectorAll('.spec-cb-' + prefix);
+        if (masterCb.checked) {{
+            cbs.forEach(cb => {{ cb.checked = false; }});
+        }}
+    }}
+    function onSpecificSpecialiteChange(prefix) {{
+        const masterCb = document.getElementById('spec-peu-importe-' + prefix);
+        if (!masterCb) return;
+        const cbs = document.querySelectorAll('.spec-cb-' + prefix);
+        let anyChecked = false;
+        cbs.forEach(cb => {{ if (cb.checked) anyChecked = true; }});
+        if (anyChecked) {{
+            masterCb.checked = false;
+        }}
+    }}
+    """)
+
+    wrapper_display = "block" if str(current_periode).strip() in ("P1", "P2") else "none"
+
+    return Div(
+        Div(
+            Div(
+                Span("🎓", style="font-size:1.1rem; margin-right:0.35rem;"),
+                Strong("Spécialité(s) souhaitée(s) en retour (P1 & P2 uniquement)", style="color:#1e40af; font-size:0.95rem; font-weight:700;"),
+                style="display:flex; align-items:center; margin-bottom:0.35rem;"
+            ),
+            P(
+                "En Master 1 (P1 et P2), vous pouvez échanger contre une spécialité identique ou différente. Cochez les spécialités que vous acceptez d'obtenir, ou cochez 'Peu importe' si vous êtes ouvert(e) à toutes.",
+                style="font-size:0.82rem; color:#475569; margin-bottom:0.75rem; line-height:1.45;"
+            ),
+            Label(
+                Input(
+                    type="checkbox",
+                    name="specialites_souhaitees",
+                    value="Peu importe / Toutes les spécialités",
+                    id=f"spec-peu-importe-{prefix}",
+                    checked=is_peu_importe,
+                    onchange=f"togglePeuImporteSpecialites('{prefix}')",
+                    style="accent-color:#1d4ed8; width:1.2rem; height:1.2rem; margin:0;"
+                ),
+                Span(
+                    Strong("✨ Peu importe / Toutes les spécialités"),
+                    " (Accepte n'importe quel stage en retour)",
+                    style="color:#1e40af; font-size:0.88rem; margin-left:0.4rem;"
+                ),
+                style="display:flex; align-items:center; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px; padding:0.6rem 0.85rem; margin-bottom:0.85rem; cursor:pointer;"
+            ),
+            Div(
+                Div(
+                    Strong("Tronc commun (6 spécialités)", style="font-size:0.84rem; color:#0f172a; display:block; margin-bottom:0.5rem; text-transform:uppercase; letter-spacing:0.03em;"),
+                    *tc_items,
+                    style="background:#ffffff; border:1px solid #e2e8f0; border-radius:8px; padding:0.75rem 0.9rem;"
+                ),
+                Div(
+                    Strong("Stages au choix (24 spécialités)", style="font-size:0.84rem; color:#0f172a; display:block; margin-bottom:0.5rem; text-transform:uppercase; letter-spacing:0.03em;"),
+                    Div(
+                        *choix_items,
+                        style="max-height:220px; overflow-y:auto; padding-right:0.25rem;"
+                    ),
+                    style="background:#ffffff; border:1px solid #e2e8f0; border-radius:8px; padding:0.75rem 0.9rem;"
+                ),
+                style="display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:0.75rem;"
+            ),
+            style="background:#f8fafc; border:1px solid #cbd5e1; border-radius:12px; padding:1.15rem; margin-bottom:1.25rem;"
+        ),
+        js_script,
+        id=f"specialites-souhaitees-wrapper-{prefix}",
+        style=f"display:{wrapper_display};"
+    )
+
 def render_hospital_checkbox_selector(
     selected_hospitals: list[str] = None,
     current_hospital: str = "",
@@ -2636,7 +2866,7 @@ def get(session, req: Request = None):
                         Label("Email institutionnel (verrouillé)", Input(value=user_email, disabled=True, style="background:#f8fafc;")),
                     ),
                     Div(
-                        Label("Période de stage *", Select(*[Option(p, value=p) for p in PERIODES], name="periode", required=True)),
+                        Label("Période de stage *", Select(*[Option(p, value=p) for p in PERIODES], name="periode", id="select-periode-depot", required=True, onchange="updateSpecialitesSouhaiteesVisibility(this.value, 'depot')")),
                         Label("Spécialité *", Select(*render_specialite_options(), name="specialite", required=True)),
                         Label(
                             "Hôpital actuel proposé *",
@@ -2651,6 +2881,7 @@ def get(session, req: Request = None):
                     ),
                     style="display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:1.5rem; margin-bottom:1rem;"
                 ),
+                render_specialites_souhaitees_selector(selected_specs=[], current_periode=PERIODES[0], prefix="depot"),
                 render_hospital_checkbox_selector(selected_hospitals=[], current_hospital=default_actuel, prefix="depot"),
                 Button(
                     "Publier ma demande de permutation",
@@ -2668,7 +2899,7 @@ def get(session, req: Request = None):
     )
 
 @rt("/nouvelle-demande")
-async def post(session, req: Request = None, periode: str = "", specialite: str = "", hopital_actuel: str = "", hopitaux_souhaites: list[str] = None):
+async def post(session, req: Request = None, periode: str = "", specialite: str = "", hopital_actuel: str = "", hopitaux_souhaites: list[str] = None, specialites_souhaitees: list[str] = None):
     u = get_session_user(session, req)
     if not u or not u.get("email"):
         return Article(P("Session expirée. Veuillez vous reconnecter.", style="color:#b91c1c; font-weight:600;"), cls="contrast")
@@ -2677,10 +2908,12 @@ async def post(session, req: Request = None, periode: str = "", specialite: str 
     user_nom = f"{u.get('prenom', '')} {u.get('nom', '')}".strip() or user_email
 
     h_list = []
+    s_list = []
     if req is not None:
         try:
             form_data = await req.form()
             h_list = form_data.getlist("hopitaux_souhaites")
+            s_list = form_data.getlist("specialites_souhaitees")
             if not periode: periode = str(form_data.get("periode", "")).strip()
             if not specialite: specialite = str(form_data.get("specialite", "")).strip()
             if not hopital_actuel: hopital_actuel = str(form_data.get("hopital_actuel", "")).strip()
@@ -2689,8 +2922,11 @@ async def post(session, req: Request = None, periode: str = "", specialite: str 
 
     if not h_list and hopitaux_souhaites:
         h_list = [hopitaux_souhaites] if isinstance(hopitaux_souhaites, str) else list(hopitaux_souhaites)
-
     h_list = [str(h).strip() for h in h_list if str(h).strip()]
+
+    if not s_list and specialites_souhaitees:
+        s_list = [specialites_souhaitees] if isinstance(specialites_souhaitees, str) else list(specialites_souhaitees)
+    s_list = [str(s).strip() for s in s_list if str(s).strip()]
 
     if not h_list:
         return Article(
@@ -2720,6 +2956,8 @@ async def post(session, req: Request = None, periode: str = "", specialite: str 
         "Hopital_Actuel": hopital_actuel,
         "hopitaux_souhaites": h_list,
         "Hopitaux_Souhaites": serialize_hospitals(h_list),
+        "specialites_souhaitees": s_list,
+        "Specialites_Souhaitees": serialize_specialites(s_list),
         "statut": "disponible",
         "Statut": "Disponible",
         "updated_at": datetime.now(ZoneInfo("Europe/Brussels")).isoformat(),
@@ -3337,6 +3575,15 @@ def get(session, f_periode: str = "Toutes", f_specialite: str = "Toutes", f_regi
             statut = row.get("Statut", "Disponible")
             st_class = "status-disponible" if statut == "Disponible" else ("status-discussion" if statut == "En discussion" else "status-accord")
 
+            spec_info = []
+            if str(row.get("Periode")).strip() in ("P1", "P2"):
+                s_wants = parse_specialites(row.get("specialites_souhaitees") or row.get("Specialites_Souhaitees"))
+                s_wants_txt = ", ".join(s_wants) if s_wants else "Peu importe / Toutes les spécialités"
+                spec_info = [
+                    Br(),
+                    Strong("Spécialité(s) souhaitée(s) : "), Span(s_wants_txt, style="color:#1d4ed8; font-weight:600;"),
+                ]
+
             cards.append(
                 Article(
                     Div(
@@ -3348,6 +3595,7 @@ def get(session, f_periode: str = "Toutes", f_specialite: str = "Toutes", f_regi
                         Strong("Hôpital proposé : "), row.get("Hopital_Actuel", ""),
                         Br(),
                         Strong("Hôpitaux souhaités : "), souhaites_str,
+                        *spec_info,
                         style="font-size:0.9rem; margin-bottom:0.4rem; line-height:1.5;"
                     ),
                     Small(f"Mis à jour le {row.get('Timestamp', '')} · Synchronisé Firestore · Anonymat garanti", style="color:#94a3b8; font-size:0.75rem;"),
@@ -3419,13 +3667,24 @@ def get(session, req: Request = None):
             cur_spec = row["Specialite"]
             cur_actuel = row["Hopital_Actuel"]
             cur_souhaites = parse_hospitals(row.get("hopitaux_souhaites") or row.get("Hopitaux_Souhaites"))
+            cur_spec_souhaites = parse_specialites(row.get("specialites_souhaitees") or row.get("Specialites_Souhaitees"))
             cur_statut = row.get("Statut", "Disponible")
             edit_prefix = f"edit-{slugify(d_id)}"
 
             edit_form = Form(
                 Input(type="hidden", name="demande_id", value=d_id),
                 Div(
-                    Div(Label("Période", Select(*[Option(p, value=p, selected=(p==cur_periode)) for p in PERIODES], name="periode"))),
+                    Div(
+                        Label(
+                            "Période",
+                            Select(
+                                *[Option(p, value=p, selected=(p==cur_periode)) for p in PERIODES],
+                                name="periode",
+                                id=f"select-periode-{edit_prefix}",
+                                onchange=f"updateSpecialitesSouhaiteesVisibility(this.value, '{edit_prefix}')"
+                            )
+                        )
+                    ),
                     Div(Label("Spécialité", Select(*render_specialite_options(selected_value=cur_spec), name="specialite"))),
                     Div(
                         Label(
@@ -3441,6 +3700,7 @@ def get(session, req: Request = None):
                     Div(Label("Statut de la demande", Select(*[Option(st, value=st, selected=(st==cur_statut)) for st in STATUTS_DEMANDE], name="statut"))),
                     style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:1rem; margin-bottom:1rem;"
                 ),
+                render_specialites_souhaitees_selector(selected_specs=cur_spec_souhaites, current_periode=cur_periode, prefix=edit_prefix),
                 render_hospital_checkbox_selector(selected_hospitals=cur_souhaites, current_hospital=cur_actuel, prefix=edit_prefix),
                 Div(
                     Button("Enregistrer les modifications", type="submit", cls="primary", style="border-radius:8px; font-weight:700;"),
@@ -3491,16 +3751,18 @@ def get(session, req: Request = None):
     )
 
 @rt("/modifier-demande")
-async def post(session, req: Request = None, demande_id: str = "", periode: str = "", specialite: str = "", hopital_actuel: str = "", statut: str = "Disponible", hopitaux_souhaites: list[str] = None):
+async def post(session, req: Request = None, demande_id: str = "", periode: str = "", specialite: str = "", hopital_actuel: str = "", statut: str = "Disponible", hopitaux_souhaites: list[str] = None, specialites_souhaitees: list[str] = None):
     u = get_session_user(session, req)
     if not u or not u.get("email"):
         return P("Session expirée.", style="color:#b91c1c; font-weight:600;")
 
     h_list = []
+    s_list = []
     if req is not None:
         try:
             form_data = await req.form()
             h_list = form_data.getlist("hopitaux_souhaites")
+            s_list = form_data.getlist("specialites_souhaitees")
             if not demande_id: demande_id = str(form_data.get("demande_id", "")).strip()
             if not periode: periode = str(form_data.get("periode", "")).strip()
             if not specialite: specialite = str(form_data.get("specialite", "")).strip()
@@ -3511,8 +3773,11 @@ async def post(session, req: Request = None, demande_id: str = "", periode: str 
 
     if not h_list and hopitaux_souhaites:
         h_list = [hopitaux_souhaites] if isinstance(hopitaux_souhaites, str) else list(hopitaux_souhaites)
-
     h_list = [str(h).strip() for h in h_list if str(h).strip()]
+
+    if not s_list and specialites_souhaitees:
+        s_list = [specialites_souhaitees] if isinstance(specialites_souhaitees, str) else list(specialites_souhaitees)
+    s_list = [str(s).strip() for s in s_list if str(s).strip()]
 
     if not h_list:
         return P("Veuillez conserver au moins un hôpital souhaité.", style="color:#b91c1c; font-weight:600;")
@@ -3527,6 +3792,9 @@ async def post(session, req: Request = None, demande_id: str = "", periode: str 
         "specialite": specialite,
         "hopital_actuel": hopital_actuel,
         "hopitaux_souhaites": h_list,
+        "Hopitaux_Souhaites": serialize_hospitals(h_list),
+        "specialites_souhaitees": s_list,
+        "Specialites_Souhaitees": serialize_specialites(s_list),
         "statut": statut,
     }
 
