@@ -27,6 +27,7 @@ import logging
 import smtplib
 from email.mime.text import MIMEText
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -824,7 +825,7 @@ def create_or_update_user(user_data: dict) -> bool:
     pin = normalize_pin(user_data.get("code_pin") or user_data.get("PIN") or "")
     nom = str(user_data.get("nom") or user_data.get("Nom") or "").strip()
     prenom = str(user_data.get("prenom") or user_data.get("Prenom") or "").strip()
-    created_at = user_data.get("created_at") or datetime.now().isoformat()
+    created_at = user_data.get("created_at") or datetime.now(ZoneInfo("Europe/Brussels")).isoformat()
     statut = user_data.get("statut") or "actif"
 
     doc_payload = {
@@ -840,7 +841,7 @@ def create_or_update_user(user_data: dict) -> bool:
         "Prenom": prenom,
         "PIN": pin,
         "Email": clean_email,
-        "Date_Inscription": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Date_Inscription": datetime.now(ZoneInfo("Europe/Brussels")).strftime("%Y-%m-%d %H:%M:%S"),
     }
 
     # 1. Écriture Firestore
@@ -1048,8 +1049,8 @@ def save_demande(demande_dict: dict) -> bool:
     elif statut in ("en_discussion", "en discussion", "en_cours"): statut_clean = "en_cours"
     else: statut_clean = "conclue"
 
-    now_iso = datetime.now().isoformat()
-    now_human = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_iso = datetime.now(ZoneInfo("Europe/Brussels")).isoformat()
+    now_human = datetime.now(ZoneInfo("Europe/Brussels")).strftime("%Y-%m-%d %H:%M:%S")
 
     doc_payload = {
         "demande_id": doc_id,
@@ -1138,7 +1139,7 @@ def load_demandes_data(force_refresh: bool = False) -> pd.DataFrame:
                 st = str(item.get("statut") or item.get("Statut") or "disponible").lower()
                 item["statut"] = "disponible" if st in ("disponible", "actif") else ("en_cours" if st in ("en_discussion", "en discussion", "en_cours") else "conclue")
                 item["Statut"] = "Disponible" if item["statut"] == "disponible" else ("En discussion" if item["statut"] == "en_cours" else "Accord trouvé")
-                item["updated_at"] = str(item.get("updated_at") or item.get("Timestamp") or datetime.now().isoformat())
+                item["updated_at"] = str(item.get("updated_at") or item.get("Timestamp") or datetime.now(ZoneInfo("Europe/Brussels")).isoformat())
                 item["Timestamp"] = str(item.get("Timestamp") or item["updated_at"][:19].replace("T", " "))
                 demandes_list.append(item)
         except Exception as exc:
@@ -1184,8 +1185,8 @@ def creer_ou_recuperer_discussion(participants: list[str], type_match: str, dema
                 "participants": sorted_p,
                 "demande_ids": demande_ids,
                 "dernier_message": "",
-                "dernier_timestamp": datetime.now().isoformat(),
-                "created_at": datetime.now().isoformat(),
+                "dernier_timestamp": datetime.now(ZoneInfo("Europe/Brussels")).isoformat(),
+                "created_at": datetime.now(ZoneInfo("Europe/Brussels")).isoformat(),
                 "statut": "nouveau",
             }
             ref.set(payload)
@@ -1204,8 +1205,8 @@ def creer_ou_recuperer_discussion(participants: list[str], type_match: str, dema
         "participants": sorted_p,
         "demande_ids": demande_ids,
         "dernier_message": "",
-        "dernier_timestamp": datetime.now().isoformat(),
-        "created_at": datetime.now().isoformat(),
+        "dernier_timestamp": datetime.now(ZoneInfo("Europe/Brussels")).isoformat(),
+        "created_at": datetime.now(ZoneInfo("Europe/Brussels")).isoformat(),
         "statut": "nouveau",
     }
     local["discussions"][disc_id] = payload
@@ -1235,7 +1236,7 @@ def get_discussion_by_id(discussion_id: str) -> dict:
 def mettre_a_jour_statut_discussion(discussion_id: str, nouveau_statut: str, confirmed_by: str = "") -> dict:
     """Met à jour le statut d'une discussion ('nouveau', 'en discussion', 'accord trouvé')."""
     disc_id = str(discussion_id).strip()
-    now_iso = datetime.now().isoformat()
+    now_iso = datetime.now(ZoneInfo("Europe/Brussels")).isoformat()
     upd = {
         "statut": nouveau_statut,
         "statut_updated_at": now_iso,
@@ -1282,8 +1283,8 @@ def envoyer_message(discussion_id: str, sender_email: str, sender_name: str, tex
         logger.warning(f"[PermutStage] Vérification premier message échouée: {exc}")
 
     msg_id = f"MSG_{uuid.uuid4().hex[:10].upper()}"
-    now_iso = datetime.now().isoformat()
-    now_human = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_iso = datetime.now(ZoneInfo("Europe/Brussels")).isoformat()
+    now_human = datetime.now(ZoneInfo("Europe/Brussels")).strftime("%Y-%m-%d %H:%M:%S")
 
     msg_payload = {
         "message_id": msg_id,
@@ -1783,7 +1784,8 @@ def get_smtp_config():
 def _send_email_smtp(dest_email: str, subject: str, body: str) -> bool:
     """
     Envoie un email via SMTP en gérant TLS (port 587) et SSL (port 465).
-    Protégé par try/except pour garantir qu'aucune exception réseau ne bloque l'application.
+    Protégé par try/except avec boucle de 3 tentatives maximum (retry) et pause de 1,5s
+    pour contourner les erreurs temporaires de résolution réseau / IPv6 (Errno 101).
     """
     clean_dest = str(dest_email or "").strip().lower()
     if not clean_dest or "@" not in clean_dest:
@@ -1800,24 +1802,30 @@ def _send_email_smtp(dest_email: str, subject: str, body: str) -> bool:
     msg["From"] = smtp_user
     msg["To"] = clean_dest
 
-    try:
-        if smtp_port == 465:
-            with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=12) as server:
-                server.login(smtp_user, smtp_password)
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP(smtp_server, smtp_port, timeout=12) as server:
-                server.ehlo()
-                if smtp_port in (587, 25):
-                    server.starttls()
+    for attempt in range(1, 4):
+        try:
+            if smtp_port == 465:
+                with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=12) as server:
+                    server.login(smtp_user, smtp_password)
+                    server.send_message(msg)
+            else:
+                with smtplib.SMTP(smtp_server, smtp_port, timeout=12) as server:
                     server.ehlo()
-                server.login(smtp_user, smtp_password)
-                server.send_message(msg)
-        logger.info(f"[PermutStage SMTP] ✅ Email envoyé avec succès à {clean_dest} (Objet: '{subject}')")
-        return True
-    except Exception as exc:
-        logger.warning(f"[PermutStage SMTP] ⚠️ Erreur lors de l'envoi email à {clean_dest}: {exc}")
-        return False
+                    if smtp_port in (587, 25):
+                        server.starttls()
+                        server.ehlo()
+                    server.login(smtp_user, smtp_password)
+                    server.send_message(msg)
+            logger.info(f"[PermutStage SMTP] ✅ Email envoyé avec succès à {clean_dest} (Objet: '{subject}') [Tentative {attempt}/3]")
+            return True
+        except Exception as exc:
+            logger.warning(f"[PermutStage SMTP] ⚠️ Erreur lors de l'envoi email à {clean_dest} (tentative {attempt}/3): {exc}")
+            if attempt < 3:
+                time.sleep(1.5)
+            else:
+                return False
+
+    return False
 
 def send_welcome_email(dest_email: str, prenom: str, nom: str, pin: str) -> bool:
     """
@@ -2308,7 +2316,7 @@ def get_session_user(session, req: Request = None) -> dict | None:
         "code_pin": session.get("pin", ""),
         "PIN": session.get("pin", ""),
         "statut": "actif",
-        "created_at": datetime.now().isoformat(),
+        "created_at": datetime.now(ZoneInfo("Europe/Brussels")).isoformat(),
     }
 
 def render_header(session, active_tab="accueil", req: Request = None):
@@ -2714,8 +2722,8 @@ async def post(session, req: Request = None, periode: str = "", specialite: str 
         "Hopitaux_Souhaites": serialize_hospitals(h_list),
         "statut": "disponible",
         "Statut": "Disponible",
-        "updated_at": datetime.now().isoformat(),
-        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": datetime.now(ZoneInfo("Europe/Brussels")).isoformat(),
+        "Timestamp": datetime.now(ZoneInfo("Europe/Brussels")).strftime("%Y-%m-%d %H:%M:%S"),
     }
 
     df_demandes_avant = load_demandes_data()
@@ -3791,14 +3799,14 @@ def handle_inscription(session, prenom: str = "", nom: str = "", email: str = ""
         "nom": clean_nom,
         "prenom": clean_prenom,
         "code_pin": clean_pin,
-        "created_at": datetime.now().isoformat(),
+        "created_at": datetime.now(ZoneInfo("Europe/Brussels")).isoformat(),
         "statut": "actif",
         "User_ID": clean_email,
         "Nom": clean_nom,
         "Prenom": clean_prenom,
         "PIN": clean_pin,
         "Email": clean_email,
-        "Date_Inscription": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Date_Inscription": datetime.now(ZoneInfo("Europe/Brussels")).strftime("%Y-%m-%d %H:%M:%S"),
     }
 
     try:
@@ -4330,7 +4338,7 @@ def get(session):
     return Response(
         csv_str,
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=permutstage_demandes_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"}
+        headers={"Content-Disposition": f"attachment; filename=permutstage_demandes_{datetime.now(ZoneInfo('Europe/Brussels')).strftime('%Y%m%d_%H%M')}.csv"}
     )
 
 # === ROUTE DE HEALTHCHECK CLOUD (RENDER / KUBERNETES) ===
