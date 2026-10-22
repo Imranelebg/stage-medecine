@@ -406,7 +406,7 @@ app, rt = fast_app(
 # ---------------------------------------------------------------------------
 PERIODES = ["P3", "P4", "P5", "P6", "P7", "P8"]
 
-SPECIALITES = [
+SPECIALITES_TRONC_COMMUN = [
     "Pédiatrie",
     "Médecine interne",
     "Gériatrie",
@@ -414,6 +414,71 @@ SPECIALITES = [
     "Urgences",
     "Chirurgie",
 ]
+
+SPECIALITES_AU_CHOIX = [
+    "Anatomie pathologique",
+    "Anesthésie-Réanimation",
+    "Biologie clinique",
+    "Chirurgie viscérale",
+    "Chirurgie thoracique",
+    "Chirurgie cardiaque",
+    "Chirurgie vasculaire",
+    "Chirurgie orthopédique",
+    "Chirurgie plastique, reconstructrice et esthétique",
+    "Dermato-vénéréologie",
+    "Génétique clinique",
+    "Médecine nucléaire",
+    "Médecine physique et réadaptation",
+    "Neurochirurgie",
+    "Neurologie",
+    "Ophtalmologie",
+    "Oto-rhino-laryngologie",
+    "Psychiatrie adulte",
+    "Psychiatrie infanto-juvénile",
+    "Radiodiagnostic",
+    "Radiothérapie-Oncologie",
+    "Stomatologie",
+    "Urologie",
+    "Médecine générale",
+]
+
+# Liste complète ordonnée pour rétrocompatibilité et moteur de matching
+SPECIALITES = SPECIALITES_TRONC_COMMUN + SPECIALITES_AU_CHOIX
+
+if "Optgroup" not in globals():
+    try:
+        from fasthtml.components import Optgroup
+    except Exception:
+        try:
+            from fasthtml.common import optgroup as Optgroup
+        except Exception:
+            def Optgroup(*children, **attrs):
+                return ft("optgroup", *children, **attrs)
+
+def render_specialite_options(selected_value: str = "", include_all: bool = False):
+    """
+    Génère la liste des options groupées par catégorie (<optgroup>) :
+    - Tronc commun (6 spécialités obligatoires)
+    - Stages au choix (24 spécialités)
+    Optionnellement précédé de 'Toutes' pour les filtres de recherche.
+    """
+    items = []
+    if include_all:
+        items.append(Option("Toutes", value="Toutes", selected=(selected_value == "Toutes" or not selected_value)))
+
+    items.append(
+        Optgroup(
+            label="Tronc commun",
+            *[Option(s, value=s, selected=(s == selected_value)) for s in SPECIALITES_TRONC_COMMUN]
+        )
+    )
+    items.append(
+        Optgroup(
+            label="Stages au choix",
+            *[Option(s, value=s, selected=(s == selected_value)) for s in SPECIALITES_AU_CHOIX]
+        )
+    )
+    return items
 
 HOPITAUX_PAR_REGION = {
     "Bruxelles": [
@@ -2347,7 +2412,7 @@ def get(session, req: Request = None):
                     ),
                     Div(
                         Label("Période de stage *", Select(*[Option(p, value=p) for p in PERIODES], name="periode", required=True)),
-                        Label("Spécialité *", Select(*[Option(s, value=s) for s in SPECIALITES], name="specialite", required=True)),
+                        Label("Spécialité *", Select(*render_specialite_options(), name="specialite", required=True)),
                         Label(
                             "Hôpital actuel proposé *",
                             Select(
@@ -2962,7 +3027,7 @@ def get(session, f_periode: str = "Toutes", f_specialite: str = "Toutes", f_regi
     filtres_form = Form(
         Div(
             Div(Label("Période", Select(Option("Toutes", value="Toutes", selected=(f_periode=="Toutes")), *[Option(p, value=p, selected=(f_periode==p)) for p in PERIODES], name="f_periode", onchange="this.form.submit()"))),
-            Div(Label("Spécialité", Select(Option("Toutes", value="Toutes", selected=(f_specialite=="Toutes")), *[Option(s, value=s, selected=(f_specialite==s)) for s in SPECIALITES], name="f_specialite", onchange="this.form.submit()"))),
+            Div(Label("Spécialité", Select(*render_specialite_options(selected_value=f_specialite, include_all=True), name="f_specialite", onchange="this.form.submit()"))),
             Div(Label("Région hôpital actuel", Select(Option("Toutes", value="Toutes", selected=(f_region=="Toutes")), *[Option(r, value=r, selected=(f_region==r)) for r in REGIONS], name="f_region", onchange="this.form.submit()"))),
             Div(Label("Recherche libre", Input(name="q", value=q, placeholder="Ex: Saint Luc, Namur...", oninput="this.form.submit()"))),
             style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:1rem; margin-bottom:1.5rem;"
@@ -3030,7 +3095,7 @@ def get(session, req: Request = None):
                 Input(type="hidden", name="demande_id", value=d_id),
                 Div(
                     Div(Label("Période", Select(*[Option(p, value=p, selected=(p==cur_periode)) for p in PERIODES], name="periode"))),
-                    Div(Label("Spécialité", Select(*[Option(s, value=s, selected=(s==cur_spec)) for s in SPECIALITES], name="specialite"))),
+                    Div(Label("Spécialité", Select(*render_specialite_options(selected_value=cur_spec), name="specialite"))),
                     Div(
                         Label(
                             "Hôpital actuel",
@@ -3942,6 +4007,11 @@ def get(session):
 @rt("/health")
 def get():
     return Response("OK", media_type="text/plain")
+
+# === VALIDATION DE PROPRIÉTÉ GOOGLE SEARCH CONSOLE (RÉFÉRENCEMENT GOOGLE) ===
+@rt("/googlef15bfd55c9dd0120.html")
+def get():
+    return Response("google-site-verification: googlef15bfd55c9dd0120.html", media_type="text/html")
 
 # ---------------------------------------------------------------------------
 # 12. DÉMARRAGE DU SERVEUR FASTHTML (COMPATIBLE RENDER & LOCAL MAC/LINUX)
