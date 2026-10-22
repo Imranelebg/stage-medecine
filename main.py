@@ -1,5 +1,5 @@
 """
-PermutStage — Plateforme Collaborative d'Échange de Lieux de Stage (Médecine P3 à P8)
+PermutStage — Plateforme Collaborative d'Échange de Lieux de Stage (Médecine P1 à P8)
 Version FastHTML (python-fasthtml) & Google Cloud Firebase Firestore (firebase-admin).
 
 Architecture complète dans un fichier unique main.py avec persistance Firestore fiabilisée à 100% :
@@ -177,6 +177,15 @@ CUSTOM_STYLE = Style("""
         padding: 1.25rem;
         margin-bottom: 1.25rem;
         color: #064e3b;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    }
+    .quad-card {
+        background-color: #faf5ff;
+        border: 1px solid #d8b4fe;
+        border-radius: 12px;
+        padding: 1.25rem;
+        margin-bottom: 1.25rem;
+        color: #581c87;
         box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
     }
 
@@ -385,7 +394,7 @@ app, rt = fast_app(
         Title("PermutStage — Plateforme d'échange de stages de médecine"),
         Meta(charset="UTF-8"),
         Meta(name="viewport", content="width=device-width, initial-scale=1.0"),
-        Meta(name="description", content="Trouvez votre binôme de stage idéal en P3, P4, P5, P6, P7 ou P8 grâce à notre moteur de matching sécurisé."),
+        Meta(name="description", content="Trouvez votre binôme de stage idéal en P1, P2, P3, P4, P5, P6, P7 ou P8 grâce à notre moteur de matching sécurisé."),
         Meta(property="og:title", content="PermutStage — Échange de stages de médecine"),
         Meta(property="og:description", content="Plateforme collaborative sécurisée de permutation de stages hospitaliers pour les étudiants en médecine."),
         Meta(property="og:type", content="website"),
@@ -404,7 +413,7 @@ app, rt = fast_app(
 # ---------------------------------------------------------------------------
 # 2. CONSTANTES MÉTIER & BASE DE DONNÉES DES HÔPITAUX PAR RÉGION
 # ---------------------------------------------------------------------------
-PERIODES = ["P3", "P4", "P5", "P6", "P7", "P8"]
+PERIODES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"]
 
 SPECIALITES_TRONC_COMMUN = [
     "Pédiatrie",
@@ -1416,8 +1425,18 @@ def compute_bilateral_matches(df: pd.DataFrame) -> list[dict]:
     for i in range(n):
         for j in range(i + 1, n):
             a, b = records[i], records[j]
-            if a["Periode"] != b["Periode"] or a["Specialite"] != b["Specialite"]:
+            # Condition 1 : Même période STRICTEMENT obligatoire
+            if a["Periode"] != b["Periode"]:
                 continue
+
+            # Condition 2 : Règle de spécialité
+            # - P1 et P2 (Master 1) : échange libre entre n'importe quelles spécialités
+            # - P3 à P8 (Master 2) : spécialité strictement identique obligatoire
+            is_m1 = a["Periode"] in ("P1", "P2")
+            if not is_m1 and a["Specialite"] != b["Specialite"]:
+                continue
+
+            # Condition 3 : Hôpitaux différents et réciprocité des vœux
             if a["Hopital_Actuel"] == b["Hopital_Actuel"]:
                 continue
 
@@ -1431,11 +1450,18 @@ def compute_bilateral_matches(df: pd.DataFrame) -> list[dict]:
                 email_a = str(a.get("user_email") or a.get("Email")).strip().lower()
                 email_b = str(b.get("user_email") or b.get("Email")).strip().lower()
                 room_id = build_discussion_id("bilateral", [email_a, email_b])
+
+                # Affichage des spécialités échangées si différentes (Master 1 P1/P2)
+                if a["Specialite"] != b["Specialite"]:
+                    spec_label = f"{a['Specialite']} ⇄ {b['Specialite']}"
+                else:
+                    spec_label = a["Specialite"]
+
                 matches.append({
                     "room_id": room_id,
                     "discussion_id": room_id,
                     "periode": a["Periode"],
-                    "specialite": a["Specialite"],
+                    "specialite": spec_label,
                     "participants": [a, b],
                     "emails": [email_a, email_b],
                     "a": a,
@@ -1461,8 +1487,15 @@ def compute_triangular_matches(df: pd.DataFrame) -> list[dict]:
             if i == j:
                 continue
             a, b = records[i], records[j]
-            if a["Periode"] != b["Periode"] or a["Specialite"] != b["Specialite"]:
+            # Même période obligatoire
+            if a["Periode"] != b["Periode"]:
                 continue
+
+            # Règle de spécialité P1/P2 vs P3-P8
+            is_m1 = a["Periode"] in ("P1", "P2")
+            if not is_m1 and a["Specialite"] != b["Specialite"]:
+                continue
+
             if a["Hopital_Actuel"] == b["Hopital_Actuel"]:
                 continue
             if a["Hopital_Actuel"] not in souhaites_map[j]:
@@ -1472,8 +1505,12 @@ def compute_triangular_matches(df: pd.DataFrame) -> list[dict]:
                 if k in (i, j):
                     continue
                 c = records[k]
-                if c["Periode"] != a["Periode"] or c["Specialite"] != a["Specialite"]:
+                if c["Periode"] != a["Periode"]:
                     continue
+
+                if not is_m1 and (c["Specialite"] != a["Specialite"] or c["Specialite"] != b["Specialite"]):
+                    continue
+
                 if (
                     c["Hopital_Actuel"] == a["Hopital_Actuel"]
                     or c["Hopital_Actuel"] == b["Hopital_Actuel"]
@@ -1499,11 +1536,17 @@ def compute_triangular_matches(df: pd.DataFrame) -> list[dict]:
                         email_b = str(b.get("user_email") or b.get("Email")).strip().lower()
                         email_c = str(c.get("user_email") or c.get("Email")).strip().lower()
                         room_id = build_discussion_id("triangulaire", [email_a, email_b, email_c])
+
+                        if a["Specialite"] == b["Specialite"] == c["Specialite"]:
+                            spec_label = a["Specialite"]
+                        else:
+                            spec_label = f"{a['Specialite']} ⇄ {b['Specialite']} ⇄ {c['Specialite']}"
+
                         matches.append({
                             "room_id": room_id,
                             "discussion_id": room_id,
                             "periode": a["Periode"],
-                            "specialite": a["Specialite"],
+                            "specialite": spec_label,
                             "participants": [a, b, c],
                             "emails": [email_a, email_b, email_c],
                             "a": a,
@@ -1512,23 +1555,137 @@ def compute_triangular_matches(df: pd.DataFrame) -> list[dict]:
                         })
     return matches
 
+def compute_quadrangular_matches(df: pd.DataFrame) -> list[dict]:
+    """
+    Détecte les cycles de permutation quadrangulaires à 4 personnes (A → B → C → D → A).
+    Conditions :
+    1. Même période pour les 4 participants.
+    2. Règle de spécialité : libre en P1/P2 (Master 1), strictement identique de P3 à P8 (Master 2).
+    3. Hôpitaux actuels tous mutuellement distincts (pas de doublon parmi les 4).
+    4. Chaîne cyclique complète d'acceptation : A -> B -> C -> D -> A.
+    5. Dédoublonnage canonique strict sur les 4 rotations circulaires possibles.
+    """
+    matches = []
+    if df.empty:
+        return matches
+    seen_cycles = set()
+    records = [
+        r for r in df.to_dict("records")
+        if str(r.get("statut") or r.get("Statut") or "").lower() not in ("conclue", "accord trouvé")
+    ]
+    n = len(records)
+    if n < 4:
+        return matches
+
+    souhaites_map = {
+        idx: set(parse_hospitals(rec.get("hopitaux_souhaites") or rec.get("Hopitaux_Souhaites")))
+        for idx, rec in enumerate(records)
+    }
+
+    for i in range(n):
+        a = records[i]
+        p_a = a["Periode"]
+        h_a = a["Hopital_Actuel"]
+        is_m1 = p_a in ("P1", "P2")
+
+        for j in range(n):
+            if j == i:
+                continue
+            b = records[j]
+            if b["Periode"] != p_a:
+                continue
+            if not is_m1 and b["Specialite"] != a["Specialite"]:
+                continue
+            h_b = b["Hopital_Actuel"]
+            if h_b == h_a or h_a not in souhaites_map[j]:
+                continue
+
+            for k in range(n):
+                if k in (i, j):
+                    continue
+                c = records[k]
+                if c["Periode"] != p_a:
+                    continue
+                if not is_m1 and c["Specialite"] != a["Specialite"]:
+                    continue
+                h_c = c["Hopital_Actuel"]
+                if h_c in (h_a, h_b) or h_b not in souhaites_map[k]:
+                    continue
+
+                for l in range(n):
+                    if l in (i, j, k):
+                        continue
+                    d = records[l]
+                    if d["Periode"] != p_a:
+                        continue
+                    if not is_m1 and d["Specialite"] != a["Specialite"]:
+                        continue
+                    h_d = d["Hopital_Actuel"]
+                    if h_d in (h_a, h_b, h_c):
+                        continue
+
+                    # Vérification des deux derniers liens de la boucle : C -> D et D -> A
+                    if h_c in souhaites_map[l] and h_d in souhaites_map[i]:
+                        id_a = f"{str(a.get('user_email') or a.get('Email')).lower()}_{p_a}"
+                        id_b = f"{str(b.get('user_email') or b.get('Email')).lower()}_{p_a}"
+                        id_c = f"{str(c.get('user_email') or c.get('Email')).lower()}_{p_a}"
+                        id_d = f"{str(d.get('user_email') or d.get('Email')).lower()}_{p_a}"
+
+                        # Dédoublonnage canonique strict des 4 rotations circulaires
+                        rotations = sorted([
+                            (id_a, id_b, id_c, id_d),
+                            (id_b, id_c, id_d, id_a),
+                            (id_c, id_d, id_a, id_b),
+                            (id_d, id_a, id_b, id_c),
+                        ])
+                        canonical = rotations[0]
+                        if canonical not in seen_cycles:
+                            seen_cycles.add(canonical)
+                            email_a = str(a.get("user_email") or a.get("Email")).strip().lower()
+                            email_b = str(b.get("user_email") or b.get("Email")).strip().lower()
+                            email_c = str(c.get("user_email") or c.get("Email")).strip().lower()
+                            email_d = str(d.get("user_email") or d.get("Email")).strip().lower()
+                            room_id = build_discussion_id("quadrille", [email_a, email_b, email_c, email_d])
+
+                            if a["Specialite"] == b["Specialite"] == c["Specialite"] == d["Specialite"]:
+                                spec_label = a["Specialite"]
+                            else:
+                                spec_label = f"{a['Specialite']} ⇄ {b['Specialite']} ⇄ {c['Specialite']} ⇄ {d['Specialite']}"
+
+                            matches.append({
+                                "room_id": room_id,
+                                "discussion_id": room_id,
+                                "periode": p_a,
+                                "specialite": spec_label,
+                                "participants": [a, b, c, d],
+                                "emails": [email_a, email_b, email_c, email_d],
+                                "a": a,
+                                "b": b,
+                                "c": c,
+                                "d": d,
+                            })
+    return matches
+
 def filter_private_matches_for_user(
     user_email: str | None,
     all_bilateral: list[dict],
     all_triangular: list[dict],
-) -> tuple[list[dict], list[dict]]:
+    all_quadrangular: list[dict] = None,
+) -> tuple[list[dict], list[dict], list[dict]]:
     if not user_email:
-        return [], []
+        return [], [], []
     clean_email = user_email.strip().lower()
     my_bi = [m for m in all_bilateral if clean_email in [e.lower() for e in m["emails"]]]
     my_tri = [t for t in all_triangular if clean_email in [e.lower() for e in t["emails"]]]
-    return my_bi, my_tri
+    my_quad = [q for q in (all_quadrangular or []) if clean_email in [e.lower() for e in q["emails"]]]
+    return my_bi, my_tri, my_quad
 
 def build_user_notifications(
     user_email: str | None,
     my_bi: list[dict],
     my_tri: list[dict],
-    df_messages: pd.DataFrame,
+    df_messages: pd.DataFrame = None,
+    my_quad: list[dict] = None,
 ) -> list[dict]:
     if not user_email:
         return []
@@ -1552,7 +1709,15 @@ def build_user_notifications(
             "room_id": t["room_id"],
         })
 
-    if not df_messages.empty and my_rooms:
+    for q in (my_quad or []):
+        my_rooms.add(q["room_id"])
+        notifs.append({
+            "titre": f"Cycle en carré disponible ({q['specialite']} · {q['periode']})",
+            "detail": "Un cycle d'échange complet à 4 étudiants a été formé.",
+            "room_id": q["room_id"],
+        })
+
+    if df_messages is not None and not df_messages.empty and my_rooms:
         msgs_for_me = df_messages[
             (df_messages["Room_ID"].isin(my_rooms))
             & (df_messages["Sender_Email"].str.lower() != clean_email)
@@ -1780,7 +1945,7 @@ def get_discussion_participant_emails(discussion_id: str) -> list[str]:
     if not emails:
         try:
             df = load_demandes_data()
-            all_m = compute_bilateral_matches(df) + compute_triangular_matches(df)
+            all_m = compute_bilateral_matches(df) + compute_triangular_matches(df) + compute_quadrangular_matches(df)
             for m in all_m:
                 if m.get("room_id") == discussion_id:
                     for p in m.get("participants", []):
@@ -2301,11 +2466,17 @@ def get(session, req: Request = None):
         print(f"[PermutStage] Erreur matching triangulaire accueil: {exc}")
         all_tri = []
 
+    try:
+        all_quad = compute_quadrangular_matches(df_demandes)
+    except Exception as exc:
+        print(f"[PermutStage] Erreur matching quadrangulaire accueil: {exc}")
+        all_quad = []
+
     return Main(
         render_header(session, "accueil", req),
         Div(
             Div(
-                Div("✨ PROMOTION MÉDECINE 2028 · MASTER 2", cls="hero-badge"),
+                Div("✨ PROMOTION MÉDECINE · MASTER 1 & MASTER 2", cls="hero-badge"),
                 H1("Trouvez votre binôme de stage idéal en quelques clics", style="font-size:2.1rem; font-weight:800;"),
                 P(
                     "Bienvenue sur ",
@@ -2327,6 +2498,7 @@ def get(session, req: Request = None):
                 Div(Div(str(len(df_demandes)), cls="stat-val"), Div("Offres actives", cls="stat-lbl"), cls="stat-card"),
                 Div(Div(str(len(all_bi)), cls="stat-val"), Div("Matchs bilatéraux (A ↔ B)", cls="stat-lbl"), cls="stat-card"),
                 Div(Div(str(len(all_tri)), cls="stat-val"), Div("Cycles triangulaires (3)", cls="stat-lbl"), cls="stat-card"),
+                Div(Div(str(len(all_quad)), cls="stat-val"), Div("Cycles en carré (4)", cls="stat-lbl"), cls="stat-card"),
                 style="display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:1rem; margin-bottom:2rem;"
             ),
             # Les 4 étapes
@@ -2338,11 +2510,11 @@ def get(session, req: Request = None):
                 ),
                 Article(
                     Strong("2. Déposer son offre"),
-                    P("Indiquez votre stage actuel (période P3 à P8, spécialité, hôpital) et cochez facilement vos hôpitaux souhaités par région.", style="font-size:0.85rem; color:#475569; margin-top:0.35rem;"),
+                    P("Indiquez votre stage actuel (période P1 à P8, spécialité, hôpital) et cochez facilement vos hôpitaux souhaités par région.", style="font-size:0.85rem; color:#475569; margin-top:0.35rem;"),
                 ),
                 Article(
                     Strong("3. Calcul des correspondances"),
-                    P("L'algorithme détecte en continu les cycles bilatéraux (A ↔ B) et triangulaires (A → B → C → A).", style="font-size:0.85rem; color:#475569; margin-top:0.35rem;"),
+                    P("L'algorithme détecte en continu les cycles bilatéraux (A ↔ B), triangulaires (A → B → C → A) et en carré (4 participants).", style="font-size:0.85rem; color:#475569; margin-top:0.35rem;"),
                 ),
                 Article(
                     Strong("4. Salon privé & Accord"),
@@ -2355,8 +2527,8 @@ def get(session, req: Request = None):
                 Article(
                     H4("⚖️ Règles d'échange", style="color:#0f172a; font-weight:700;"),
                     Ul(
-                        Li(Strong("Même période obligatoire : "), "P3 contre P3, P4 contre P4, etc."),
-                        Li(Strong("Même spécialité obligatoire : "), "Pédiatrie contre Pédiatrie, Chirurgie contre Chirurgie."),
+                        Li(Strong("Même période obligatoire : "), "P1 contre P1, P2 contre P2, etc. jusqu'à P8."),
+                        Li(Strong("Règle de spécialité : "), "Spécialité libre en Master 1 (P1 et P2) ; même spécialité obligatoire de P3 à P8 (Master 2)."),
                         Li(Strong("Validation facultaire : "), "L'accord trouvé sur l'application reste un accord de principe à soumettre à la commission des stages.")
                     )
                 ),
@@ -2369,6 +2541,51 @@ def get(session, req: Request = None):
                     )
                 ),
                 style="display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap:1rem;"
+            ),
+            # Règle spéciale Master 1 (P1 & P2)
+            Article(
+                H4("🎓 Règle spéciale Master 1 (P1 & P2)", style="color:#1d4ed8; font-weight:700; margin-bottom:0.75rem;"),
+                P(
+                    "Pour les périodes ", Strong("P1 et P2"), " (premiers stages de Master 1), la permutation est officiellement autorisée ",
+                    Strong("entre spécialités identiques OU différentes"), " (par exemple : échanger un stage de ", Em("Pédiatrie"), " contre un stage de ", Em("Chirurgie"), "), ",
+                    "du moment que l'échange a lieu durant la même période (P1 contre P1, P2 contre P2) et dans les hôpitaux réciproquement souhaités.",
+                    style="font-size:0.92rem; color:#334155; line-height:1.6; margin-bottom:0.6rem;"
+                ),
+                P(
+                    "💡 ", Strong("Rappel Master 2 (P3 à P8) : "),
+                    "De la période P3 à P8, la règle stricte de la ",
+                    Strong("même spécialité obligatoire"), " (ex: Pédiatrie contre Pédiatrie) continue de s'appliquer sans exception.",
+                    style="font-size:0.88rem; color:#64748b; margin-bottom:0;"
+                ),
+                style="background:#ffffff; border:1px solid #e2e8f0; border-radius:12px; padding:1.5rem; margin-top:1.25rem; box-shadow:0 1px 3px rgba(15, 23, 42, 0.05);"
+            ),
+            # Mentions légales, vie privée & consentement des utilisateurs
+            Article(
+                H4("📋 Mentions légales, vie privée & consentement des utilisateurs", style="color:#0f172a; font-weight:700; margin-bottom:1rem; font-size:1.05rem; display:flex; align-items:center; gap:0.5rem;"),
+                Div(
+                    Div(
+                        Strong("1. Initiative étudiante indépendante : "),
+                        "PermutStage est un outil numérique bénévole, développé de manière totalement indépendante de toute autorité universitaire, décanale ou facultaire. Il a pour unique vocation d'aider les étudiants dans l'organisation de leurs souhaits d'échange.",
+                        style="margin-bottom:0.75rem; font-size:0.875rem; line-height:1.6;"
+                    ),
+                    Div(
+                        Strong("2. Finalité académique exclusive & Consentement éclairé : "),
+                        "En utilisant la plateforme et en créant un compte, chaque étudiant·e consent expressément à ce que ses nom, prénom et adresse e-mail institutionnelle soient enregistrés et utilisés exclusivement à des fins d'organisation et d'échange de lieux de stages hospitaliers entre camarades de promotion.",
+                        style="margin-bottom:0.75rem; font-size:0.875rem; line-height:1.6;"
+                    ),
+                    Div(
+                        Strong("3. Confidentialité & Non-commercialisation des données : "),
+                        "Aucune donnée personnelle n'est vendue, cédée, louée ou utilisée à des fins publicitaires. Les coordonnées directes ne sont visibles qu'entre étudiants partageant une opportunité de match réciproque validée par l'algorithme.",
+                        style="margin-bottom:0.75rem; font-size:0.875rem; line-height:1.6;"
+                    ),
+                    Div(
+                        Strong("4. Valeur juridique de l'échange & Validation facultaire : "),
+                        "La plateforme n'a aucun pouvoir d'attribution officiel ni de modification réglementaire des affectations. Les accords trouvés sur PermutStage constituent de simples accords de principe mutuels, sous réserve expresse de validation formelle ultérieure par la commission des stages de la faculté.",
+                        style="font-size:0.875rem; line-height:1.6;"
+                    ),
+                    style="color:#334155;"
+                ),
+                style="background:#f8fafc; border:1px solid #cbd5e1; border-radius:12px; padding:1.5rem; margin-top:1.5rem; box-shadow:0 1px 3px rgba(15, 23, 42, 0.04);"
             ),
             cls="container"
         ),
@@ -2504,19 +2721,24 @@ async def post(session, req: Request = None, periode: str = "", specialite: str 
     df_demandes_avant = load_demandes_data()
     all_bi_avant = compute_bilateral_matches(df_demandes_avant)
     all_tri_avant = compute_triangular_matches(df_demandes_avant)
-    anciens_rooms = {m["room_id"] for m in all_bi_avant} | {t["room_id"] for t in all_tri_avant}
+    all_quad_avant = compute_quadrangular_matches(df_demandes_avant)
+    anciens_rooms = {m["room_id"] for m in all_bi_avant} | {t["room_id"] for t in all_tri_avant} | {q["room_id"] for q in all_quad_avant}
 
     if save_demande(demande_data):
         df_maj = load_demandes_data()
         df_users = load_all_users()
         nouveaux_bi = compute_bilateral_matches(df_maj)
         nouveaux_tri = compute_triangular_matches(df_maj)
+        nouveaux_quad = compute_quadrangular_matches(df_maj)
         for m in nouveaux_bi:
             if m["room_id"] not in anciens_rooms:
                 send_match_notification_emails(m["participants"], m["periode"], m["specialite"], m["room_id"], df_users)
         for t in nouveaux_tri:
             if t["room_id"] not in anciens_rooms:
                 send_match_notification_emails(t["participants"], t["periode"], t["specialite"], t["room_id"], df_users)
+        for q in nouveaux_quad:
+            if q["room_id"] not in anciens_rooms:
+                send_match_notification_emails(q["participants"], q["periode"], q["specialite"], q["room_id"], df_users)
 
         return Article(
             H4("🎉 Offre publiée et enregistrée dans Firestore !", style="color:#14532d; font-weight:800; margin-bottom:0.4rem;"),
@@ -2549,7 +2771,8 @@ def get(session, req: Request = None):
     df_demandes = load_demandes_data()
     all_bi = compute_bilateral_matches(df_demandes)
     all_tri = compute_triangular_matches(df_demandes)
-    my_bi, my_tri = filter_private_matches_for_user(user_email, all_bi, all_tri)
+    all_quad = compute_quadrangular_matches(df_demandes)
+    my_bi, my_tri, my_quad = filter_private_matches_for_user(user_email, all_bi, all_tri, all_quad)
 
     bi_sections = []
     if not my_bi:
@@ -2762,6 +2985,105 @@ def get(session, req: Request = None):
                 )
             )
 
+    quad_sections = []
+    if not my_quad:
+        quad_sections.append(P("Aucun cycle en carré à 4 personnes ne vous concerne actuellement.", style="color:#64748b; font-style:italic;"))
+    else:
+        for q in my_quad:
+            a, b, c, d = q["a"], q["b"], q["c"], q["d"]
+            room_id = q["room_id"]
+            msgs_salon = recuperer_messages(room_id)
+            chat_elements = []
+            for msg in msgs_salon:
+                is_me = (msg.get("sender_email") or msg.get("Sender_Email") or "").strip().lower() == user_email.lower()
+                chat_elements.append(
+                    Div(
+                        Strong(msg.get("sender_name") or msg.get("Sender_Name")),
+                        Small(f" · {msg.get('timestamp') or msg.get('Timestamp')}", style="font-size:0.75rem; opacity:0.8;"),
+                        P(msg.get("texte") or msg.get("Texte"), style="margin:0.2rem 0 0 0;"),
+                        cls=f"chat-bubble {'chat-me' if is_me else 'chat-other'}"
+                    )
+                )
+
+            disc_q = get_discussion_by_id(room_id)
+            statut_q = disc_q.get("statut") or ("en discussion" if msgs_salon else "nouveau")
+            if statut_q == "accord trouvé":
+                status_tag_q = Span("🎉 Accord trouvé", cls="status-badge", style="background:#dcfce7; color:#166534; border:1px solid #86efac; font-weight:800; font-size:0.78rem; padding:0.25rem 0.65rem; border-radius:9999px; float:right;")
+                accord_action_q = Div(
+                    P("🎉 Accord d'échange officiellement confirmé !", style="font-weight:700; color:#166534; margin:0; font-size:0.85rem;"),
+                    id=f"match-accord-{slugify(room_id)}",
+                    style="background:#f0fdf4; border:1px solid #86efac; padding:0.5rem 0.75rem; border-radius:8px; margin-top:0.6rem;"
+                )
+            else:
+                if statut_q == "en discussion":
+                    status_tag_q = Span("💬 En discussion", cls="status-badge", style="background:#f3e8ff; color:#6b21a8; border:1px solid #d8b4fe; font-weight:700; font-size:0.78rem; padding:0.25rem 0.65rem; border-radius:9999px; float:right;")
+                else:
+                    status_tag_q = Span("⏳ Nouveau salon", cls="status-badge", style="background:#f1f5f9; color:#475569; border:1px solid #cbd5e1; font-weight:700; font-size:0.78rem; padding:0.25rem 0.65rem; border-radius:9999px; float:right;")
+                accord_action_q = Div(
+                    Form(
+                        Input(type="hidden", name="discussion_id", value=room_id),
+                        Button(
+                            "🤝 Confirmer l'accord trouvé",
+                            type="submit",
+                            cls="outline",
+                            style="border-color:#7c3aed; color:#6d28d9; font-weight:700; border-radius:8px; font-size:0.8rem; padding:0.35rem 0.75rem; margin:0;",
+                        ),
+                        hx_post="/demander-confirmation-accord",
+                        hx_target=f"#match-accord-{slugify(room_id)}",
+                        hx_swap="outerHTML"
+                    ),
+                    id=f"match-accord-{slugify(room_id)}",
+                    style="margin-top:0.6rem;"
+                )
+
+            quad_sections.append(
+                Article(
+                    Div(
+                        Strong(f"MATCH PRIVÉ EN CARRÉ (4) · {q['periode']} · {q['specialite']}", style="color:#581c87; font-size:0.95rem; font-weight:800;"),
+                        status_tag_q,
+                        style="margin-bottom:0.75rem;"
+                    ),
+                    P(
+                        Strong(a["Nom"]), f" ({a['Hopital_Actuel']}) → ",
+                        Strong(b["Nom"]), f" ({b['Hopital_Actuel']}) → ",
+                        Strong(c["Nom"]), f" ({c['Hopital_Actuel']}) → ",
+                        Strong(d["Nom"]), f" ({d['Hopital_Actuel']}) → ",
+                        Strong(a["Nom"]),
+                        style="font-size:0.92rem; line-height:1.5; margin-bottom:0.4rem;"
+                    ),
+                    P(
+                        "Coordonnées du cycle : ",
+                        A(a["Email"], href=f"mailto:{a['Email']}"), " · ",
+                        A(b["Email"], href=f"mailto:{b['Email']}"), " · ",
+                        A(c["Email"], href=f"mailto:{c['Email']}"), " · ",
+                        A(d["Email"], href=f"mailto:{d['Email']}"),
+                        style="font-size:0.83rem; color:#6d28d9;"
+                    ),
+                    accord_action_q,
+                    Details(
+                        Summary(f"💬 Salon de discussion privé ({len(msgs_salon)} messages)"),
+                        Div(
+                            Div(*chat_elements, id=f"chat-box-{slugify(room_id)}", style="max-height:220px; overflow-y:auto; margin:0.75rem 0; padding:0.6rem; background:#ffffff; border-radius:10px; border:1px solid #e2e8f0;"),
+                            Form(
+                                Div(
+                                    Input(name="texte", placeholder="Écrire un message aux collègues du cycle à 4...", required=True, style="margin-bottom:0;"),
+                                    Input(type="hidden", name="discussion_id", value=room_id),
+                                    Input(type="hidden", name="room_id", value=room_id),
+                                    Button("Envoyer", type="submit", cls="primary", style="margin-bottom:0; width:auto; border-radius:8px;"),
+                                    style="display:flex; gap:0.5rem;"
+                                ),
+                                hx_post="/envoyer-message",
+                                hx_target=f"#chat-box-{slugify(room_id)}",
+                                hx_swap="innerHTML"
+                            ),
+                            A("Ouvrir en plein écran", href=f"/salon/{room_id}", style="font-size:0.78rem; display:inline-block; margin-top:0.4rem;"),
+                            style="margin-top:0.5rem;"
+                        )
+                    ),
+                    cls="quad-card"
+                )
+            )
+
     return Main(
         render_header(session, "matchs", req),
         Div(
@@ -2770,7 +3092,8 @@ def get(session, req: Request = None):
             Div(
                 Div(H3(f"Binômes bilatéraux ({len(my_bi)})", style="font-size:1.15rem; font-weight:700;"), *bi_sections),
                 Div(H3(f"Cycles triangulaires ({len(my_tri)})", style="font-size:1.15rem; font-weight:700;"), *tri_sections),
-                style="display:grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap:1.5rem;"
+                Div(H3(f"Cycles en carré (4) ({len(my_quad)})", style="font-size:1.15rem; font-weight:700;"), *quad_sections),
+                style="display:grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap:1.5rem;"
             ),
             cls="container"
         ),
@@ -3202,7 +3525,8 @@ async def post(session, req: Request = None, demande_id: str = "", periode: str 
     df_demandes_avant = load_demandes_data()
     all_bi_avant = compute_bilateral_matches(df_demandes_avant)
     all_tri_avant = compute_triangular_matches(df_demandes_avant)
-    anciens_rooms = {m["room_id"] for m in all_bi_avant} | {t["room_id"] for t in all_tri_avant}
+    all_quad_avant = compute_quadrangular_matches(df_demandes_avant)
+    anciens_rooms = {m["room_id"] for m in all_bi_avant} | {t["room_id"] for t in all_tri_avant} | {q["room_id"] for q in all_quad_avant}
 
     if save_demande(update_payload):
         df_maj = load_demandes_data()
@@ -3210,12 +3534,16 @@ async def post(session, req: Request = None, demande_id: str = "", periode: str 
         try:
             nouveaux_bi = compute_bilateral_matches(df_maj)
             nouveaux_tri = compute_triangular_matches(df_maj)
+            nouveaux_quad = compute_quadrangular_matches(df_maj)
             for m in nouveaux_bi:
                 if m["room_id"] not in anciens_rooms:
                     send_match_notification_emails(m["participants"], m["periode"], m["specialite"], m["room_id"], df_users)
             for t in nouveaux_tri:
                 if t["room_id"] not in anciens_rooms:
                     send_match_notification_emails(t["participants"], t["periode"], t["specialite"], t["room_id"], df_users)
+            for q in nouveaux_quad:
+                if q["room_id"] not in anciens_rooms:
+                    send_match_notification_emails(q["participants"], q["periode"], q["specialite"], q["room_id"], df_users)
         except Exception as exc:
             logger.warning(f"[PermutStage] Erreur non-bloquante notification match après modif: {exc}")
 
@@ -3796,8 +4124,9 @@ def get(session, req: Request = None):
     df_messages = load_messages_data()
     all_bi = compute_bilateral_matches(df_demandes)
     all_tri = compute_triangular_matches(df_demandes)
-    my_bi, my_tri = filter_private_matches_for_user(user_email, all_bi, all_tri)
-    notifs = build_user_notifications(user_email, my_bi, my_tri, df_messages)
+    all_quad = compute_quadrangular_matches(df_demandes)
+    my_bi, my_tri, my_quad = filter_private_matches_for_user(user_email, all_bi, all_tri, all_quad)
+    notifs = build_user_notifications(user_email, my_bi, my_tri, df_messages, my_quad)
 
     cards = []
     if not notifs:
@@ -3888,6 +4217,7 @@ def get(session, req: Request = None):
     df_demandes = load_demandes_data()
     all_bi = compute_bilateral_matches(df_demandes)
     all_tri = compute_triangular_matches(df_demandes)
+    all_quad = compute_quadrangular_matches(df_demandes)
 
     demandes_rows = []
     for _, d in df_demandes.iterrows():
@@ -3944,6 +4274,7 @@ def get(session, req: Request = None):
                 Div(Div(str(len(df_demandes)), cls="stat-val"), Div("Offres actives", cls="stat-lbl"), cls="stat-card"),
                 Div(Div(str(len(all_bi)), cls="stat-val"), Div("Matchs binômes", cls="stat-lbl"), cls="stat-card"),
                 Div(Div(str(len(all_tri)), cls="stat-val"), Div("Boucles triangulaires", cls="stat-lbl"), cls="stat-card"),
+                Div(Div(str(len(all_quad)), cls="stat-val"), Div("Cycles en carré (4)", cls="stat-lbl"), cls="stat-card"),
                 style="display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:1rem; margin-bottom:2rem;"
             ),
             Article(
@@ -4011,7 +4342,7 @@ def get():
 # === VALIDATION DE PROPRIÉTÉ GOOGLE SEARCH CONSOLE (RÉFÉRENCEMENT GOOGLE) ===
 @rt("/googleb26e30d985ea7bf8.html")
 def get():
-    return Response("google-site-verification: googleb26e30d985ea7bf8.html", media_type="text/html")
+    return Response("google-site-verification: googlef15bfd55c9dd0120.html", media_type="text/html")
 
 # ---------------------------------------------------------------------------
 # 12. DÉMARRAGE DU SERVEUR FASTHTML (COMPATIBLE RENDER & LOCAL MAC/LINUX)
