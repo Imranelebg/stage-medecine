@@ -23,6 +23,7 @@ import re
 import uuid
 import json
 import time
+import socket
 import logging
 import smtplib
 from email.mime.text import MIMEText
@@ -1874,9 +1875,10 @@ def get_smtp_config():
 def _send_email_smtp(dest_email: str, subject: str, body: str) -> bool:
     """
     Envoie un email via SMTP en gérant TLS (port 587) et SSL (port 465).
-    Protégé par try/except avec boucle de 3 tentatives maximum (retry) et pause de 1,5s
-    pour contourner les erreurs temporaires de résolution réseau / IPv6 (Errno 101).
+    Protégé par try/except avec résolution IPv4 forcée (socket.AF_INET) et boucle de 3 tentatives (retry)
+    avec pause de 1 seconde entre chaque en cas d'erreur OS/réseau (ex: Errno 101 / IPv6 sur Render).
     """
+    import socket
     clean_dest = str(dest_email or "").strip().lower()
     if not clean_dest or "@" not in clean_dest:
         return False
@@ -1894,24 +1896,42 @@ def _send_email_smtp(dest_email: str, subject: str, body: str) -> bool:
 
     for attempt in range(1, 4):
         try:
+            # 1. Forcer la résolution DNS en IPv4 pour contourner l'absence d'IPv6 sur Render (Errno 101)
+            target_ip = smtp_server
+            try:
+                addr_info = socket.getaddrinfo(smtp_server, smtp_port, socket.AF_INET, socket.SOCK_STREAM)
+                if addr_info:
+                    target_ip = addr_info[0][4][0]
+            except Exception as dns_err:
+                logger.warning(f"[PermutStage SMTP] Avertissement résolution IPv4 pour {smtp_server}: {dns_err}")
+                target_ip = smtp_server
+
+            # 2. Connexion SMTP sécurisée via l'adresse IPv4 résolue avec préservation du SNI pour la validation TLS/SSL
             if smtp_port == 465:
-                with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=12) as server:
+                server = smtplib.SMTP_SSL(timeout=12)
+                server._host = smtp_server
+                with server:
+                    server.connect(target_ip, smtp_port)
                     server.login(smtp_user, smtp_password)
                     server.send_message(msg)
             else:
-                with smtplib.SMTP(smtp_server, smtp_port, timeout=12) as server:
+                server = smtplib.SMTP(timeout=12)
+                server._host = smtp_server
+                with server:
+                    server.connect(target_ip, smtp_port)
                     server.ehlo()
                     if smtp_port in (587, 25):
                         server.starttls()
                         server.ehlo()
                     server.login(smtp_user, smtp_password)
                     server.send_message(msg)
+
             logger.info(f"[PermutStage SMTP] ✅ Email envoyé avec succès à {clean_dest} (Objet: '{subject}') [Tentative {attempt}/3]")
             return True
         except Exception as exc:
             logger.warning(f"[PermutStage SMTP] ⚠️ Erreur lors de l'envoi email à {clean_dest} (tentative {attempt}/3): {exc}")
             if attempt < 3:
-                time.sleep(1.5)
+                time.sleep(1)
             else:
                 return False
 
@@ -1979,7 +1999,7 @@ def send_match_notification_emails(
     """
     Alerte individuellement chaque participant d'un match (bilatéral A <-> B ou cycle triangulaire A -> B -> C -> A)
     avec la spécialité, la période et le lien vers leur salon privé.
-    Système anti-doublon NOTIFIED_MATCH_ROOMS pour éviter tout spam.
+    Système anti-doublon NOTIFIED_MATCH_ROOMS pour éviter tout spam : la room n'est ajoutée que si au moins un e-mail a été envoyé.
     """
     global NOTIFIED_MATCH_ROOMS
     if room_id in NOTIFIED_MATCH_ROOMS:
@@ -1987,7 +2007,6 @@ def send_match_notification_emails(
 
     smtp_cfg = get_smtp_config()
     if not smtp_cfg:
-        NOTIFIED_MATCH_ROOMS.add(room_id)
         return 0
 
     sent_count = 0
@@ -1995,11 +2014,24 @@ def send_match_notification_emails(
     sujet = f"[PermutStage] Correspondance trouvée pour votre stage de {specialite} ({periode}) !"
 
     try:
+        # Collecter les adresses uniques des participants
         for p in participants:
             dest_email = str(p.get("Email") or p.get("user_email") or p.get("email") or "").strip().lower()
-            if not dest_email or dest_email in seen_dest:
+            if dest_email and "@" in dest_email:
+                seen_dest.add(dest_email)
+
+        if not seen_dest:
+            return 0
+
+        # Log clair sur Render pour tracer la notification
+        print(f"[PermutStage Match] Tentative d'envoi d'e-mails pour la room {room_id} aux participants: {seen_dest}")
+
+        sent_emails = set()
+        for p in participants:
+            dest_email = str(p.get("Email") or p.get("user_email") or p.get("email") or "").strip().lower()
+            if not dest_email or dest_email in sent_emails:
                 continue
-            seen_dest.add(dest_email)
+            sent_emails.add(dest_email)
 
             nom = str(p.get("Nom") or p.get("nom_etudiant") or p.get("prenom") or "Étudiant(e)").strip()
             corps = (
@@ -2017,11 +2049,12 @@ def send_match_notification_emails(
             except Exception as mail_err:
                 logger.warning(f"[PermutStage] Erreur envoi mail match à {dest_email}: {mail_err}")
 
-        NOTIFIED_MATCH_ROOMS.add(room_id)
+        # La room n'est verrouillée que si au moins un e-mail a été envoyé avec succès
+        if sent_count > 0:
+            NOTIFIED_MATCH_ROOMS.add(room_id)
         return sent_count
     except Exception as exc:
         logger.warning(f"[PermutStage] Erreur générale send_match_notification_emails: {exc}")
-        NOTIFIED_MATCH_ROOMS.add(room_id)
         return sent_count
 
 def get_discussion_participant_emails(discussion_id: str) -> list[str]:
